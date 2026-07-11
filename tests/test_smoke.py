@@ -1,23 +1,31 @@
 ﻿import sqlite3
+import json
+import subprocess
 import sys
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from agentic_code_audit.audit_budget import AuditBudget
 from agentic_code_audit.agents.mining import (
     CandidateGenerator,
     ClueAggregator,
+    coerce_str_list,
     DangerousFunctionLocator,
+    MiningResult,
     SliceAnalyzer,
     VulnerabilityClassifier,
 )
+from agentic_code_audit.agents.mining_director import CodeExplorationTools, MiningDirector, MiningStrategy, ToolSelection
 from agentic_code_audit.agents.profiler import ProjectProfiler
 from agentic_code_audit.agents.recon import ReconAgent
 from agentic_code_audit.agents.verification import (
+    BuildDecision,
     BuildManager,
     CheckerOutcome,
     CommandInjectionChecker,
     DependencyChecker,
+    DynamicPlanner,
     EnvironmentManager,
     EvidenceChecker,
     ExploitAgent,
@@ -25,10 +33,12 @@ from agentic_code_audit.agents.verification import (
     MemorySafetyChecker,
     PathTraversalChecker,
     PocAnalysis,
+    PocGenerator,
     PocPlan,
     RuntimeManager,
     SandboxExecutor,
     SQLInjectionChecker,
+    StaticVerifier,
     VerificationAgent,
     VerificationPlanner,
 )
@@ -40,6 +50,7 @@ from agentic_code_audit.models import (
     AuditReport,
     DangerousFunction,
     Finding,
+    FunctionSummary,
     InputSource,
     ProgramSlice,
     ProjectProfile,
@@ -54,6 +65,7 @@ from agentic_code_audit.store import AuditStore
 from agentic_code_audit.tools.runner import (
     ArtifactManager,
     ToolCache,
+    ToolAvailability,
     ToolDefinition,
     ToolInvocation,
     ToolParsers,
@@ -61,6 +73,8 @@ from agentic_code_audit.tools.runner import (
     ToolRegistry,
     ToolRunner,
 )
+from agentic_code_audit.mining_debug import generate_mining_debug
+from agentic_code_audit.pipeline import AuditPipeline
 
 
 class FakeLLM:
@@ -584,6 +598,113 @@ def test_target_resolver_prefers_existing_local_path():
     )
 
 
+def test_target_resolver_skips_pull_when_cached_repo_has_tracked_changes(tmp_path: Path):
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    workspace = tmp_path / "runs"
+    url = "https://github.com/example/dirty.git"
+    repo_id = __import__("hashlib").sha1(url.encode("utf-8")).hexdigest()[:12]
+    cached = workspace / "repos" / repo_id
+
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "clone", str(remote), str(seed)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=seed, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=seed, check=True)
+    (seed / "src").mkdir()
+    (seed / "src" / "basicio.cpp").write_text("int old_value = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "src/basicio.cpp"], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=seed, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "push", "origin", "HEAD:main"], cwd=seed, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "clone", str(remote), str(cached)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "checkout", "main"], cwd=cached, check=True, capture_output=True, text=True)
+
+    (cached / "src" / "basicio.cpp").write_text("int local_change = 2;\n", encoding="utf-8")
+    source = TargetResolver(workspace).resolve("example/dirty")
+
+    assert source.kind == "git"
+    assert Path(source.local_path) == cached.resolve()
+    assert (cached / "src" / "basicio.cpp").read_text(encoding="utf-8") == "int local_change = 2;\n"
+
+
+def test_target_resolver_normalizes_github_tree_url_to_branch_clone(tmp_path: Path, monkeypatch):
+    import shutil
+
+    workspace = tmp_path / "runs"
+    commands: list[list[str]] = []
+    monkeypatch.setattr(shutil, "which", lambda name: "git" if name == "git" else None)
+
+    def fake_run_git(self, command: list[str], cwd: Path) -> str:
+        commands.append(command)
+        if command[:3] == ["git", "ls-remote", "--heads"]:
+            return "abc\trefs/tags/v2.7.5\n"
+        if command[:3] == ["git", "clone", "--depth"]:
+            repo_dir = Path(command[-1])
+            (repo_dir / ".git").mkdir(parents=True)
+            return ""
+        if command == ["git", "rev-parse", "HEAD"]:
+            return "abc123\n"
+        raise AssertionError(command)
+
+    monkeypatch.setattr(TargetResolver, "_run_git", fake_run_git)
+
+    source = TargetResolver(workspace).resolve("https://github.com/OpenVPN/openvpn/tree/v2.7.5.git")
+
+    assert source.commit == "abc123"
+    assert [
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        "v2.7.5",
+        "--single-branch",
+        "https://github.com/OpenVPN/openvpn.git",
+        source.local_path,
+    ] in commands
+
+
+def test_target_resolver_resolves_slash_branch_before_tree_path(tmp_path: Path, monkeypatch):
+    import shutil
+
+    workspace = tmp_path / "runs"
+    commands: list[list[str]] = []
+    monkeypatch.setattr(shutil, "which", lambda name: "git" if name == "git" else None)
+
+    def fake_run_git(self, command: list[str], cwd: Path) -> str:
+        commands.append(command)
+        if command[:3] == ["git", "ls-remote", "--heads"]:
+            return "\n".join(
+                [
+                    "abc\trefs/heads/main",
+                    "def\trefs/heads/release/v2.7.5",
+                ]
+            )
+        if command[:3] == ["git", "clone", "--depth"]:
+            repo_dir = Path(command[-1])
+            (repo_dir / ".git").mkdir(parents=True)
+            return ""
+        if command == ["git", "rev-parse", "HEAD"]:
+            return "def456\n"
+        raise AssertionError(command)
+
+    monkeypatch.setattr(TargetResolver, "_run_git", fake_run_git)
+
+    source = TargetResolver(workspace).resolve("https://github.com/OpenVPN/openvpn/tree/release/v2.7.5/src/openvpn")
+
+    assert source.commit == "def456"
+    assert [
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        "release/v2.7.5",
+        "--single-branch",
+        "https://github.com/OpenVPN/openvpn.git",
+        source.local_path,
+    ] in commands
+
+
 def test_dangerous_locator_and_slice_include_source_sink(tmp_path: Path):
     target = tmp_path / "project"
     target.mkdir()
@@ -702,6 +823,297 @@ def test_candidate_generator_accepts_labeled_confidence():
     assert candidates
     assert candidates[0].confidence == 0.8
     assert candidates[0].severity == "high"
+
+
+def test_coerce_str_list_preserves_string_as_single_item():
+    assert coerce_str_list("GitHub Actions") == ["GitHub Actions"]
+    assert coerce_str_list(["source", "sink"]) == ["source", "sink"]
+    assert coerce_str_list(None) == []
+
+
+def test_llm_string_evidence_is_not_split_into_characters():
+    class EvidenceLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            return type(
+                "Resp",
+                (),
+                {
+                    "ok": True,
+                    "content": (
+                        '[{"title":"command injection","vulnerability_type":"command_injection",'
+                        '"severity":"high","description":"input reaches shell",'
+                        '"trigger_condition":"request args reaches os.system",'
+                        '"evidence":"GitHub Actions","confidence":"high","valid":true}]'
+                    ),
+                    "error": "",
+                },
+            )()
+
+    program_slice = ProgramSlice(
+        id="slice-1",
+        dangerous_function_id="danger-1",
+        file_path="app.py",
+        line_start=12,
+        function_name="ping",
+        source="request.args",
+        sink="os.system",
+        context="12: os.system(value)",
+    )
+
+    candidates = CandidateGenerator().generate([program_slice], EvidenceLLM())  # type: ignore[arg-type]
+
+    assert candidates[0].evidence == ["GitHub Actions"]
+
+
+def test_audit_budget_modes_are_enforced_in_mining_components(tmp_path: Path):
+    target = tmp_path / "project"
+    target.mkdir()
+    for idx in range(20):
+        (target / f"app{idx}.py").write_text(
+            f"import os\n\ndef run{idx}(cmd):\n    return os.system(cmd)\n",
+            encoding="utf-8",
+        )
+    budget = AuditBudget.for_mode("quick")
+
+    dangerous = DangerousFunctionLocator().locate(target, [], budget)
+    slices = SliceAnalyzer().analyze(target, dangerous, SemanticIndex(), FakeLLM(), budget)  # type: ignore[arg-type]
+    candidates = CandidateGenerator().generate(slices, FakeLLM(), budget)  # type: ignore[arg-type]
+
+    assert len(dangerous) <= budget.max_anchors
+    assert len(slices) <= budget.max_slices
+    assert len(candidates) <= budget.max_candidates
+
+
+def test_quick_budget_suppresses_config_anchors(tmp_path: Path):
+    target = tmp_path / "repo"
+    workflow = target / ".github" / "workflows" / "ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("steps:\n  - uses: actions/checkout@master\n", encoding="utf-8")
+    semgrep_result = ToolResult(
+        tool="semgrep",
+        status="ok",
+        run_id="semgrep-run",
+        raw={
+            "results": [
+                {
+                    "path": ".github/workflows/ci.yml",
+                    "start": {"line": 2},
+                    "check_id": "yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag",
+                    "extra": {"lines": "uses: actions/checkout@master", "message": "Action tag is mutable."},
+                }
+            ]
+        },
+    )
+
+    dangerous = DangerousFunctionLocator().locate(target, [semgrep_result], AuditBudget.for_mode("quick"))
+
+    assert dangerous == []
+
+
+def test_mining_director_rejects_invalid_strategy_items(tmp_path: Path):
+    target = tmp_path / "repo"
+    (target / "src").mkdir(parents=True)
+    (target / ".github" / "workflows").mkdir(parents=True)
+    (target / "src" / "parser.cpp").write_text("void parseImage() {}\n", encoding="utf-8")
+    (target / ".github" / "workflows" / "ci.yml").write_text("uses: actions/checkout@master\n", encoding="utf-8")
+    profile = ProjectProfile(root=str(target), languages={"C++": 1})
+    semantic_index = SemanticIndex(
+        functions=[FunctionSummary(name="parseImage", file_path="src/parser.cpp", line_start=1, signature="", summary="")]
+    )
+    tools = [
+        ToolAvailability("semgrep", "semgrep", True, False, "static-analysis"),
+        ToolAvailability("cppcheck", "cppcheck", False, False, "cpp-static-analysis", reason="missing"),
+    ]
+    strategy = MiningStrategy(
+        tool_selections=[
+            ToolSelection(name="cppcheck", priority=1),
+            ToolSelection(name="semgrep", priority=2),
+            ToolSelection(name="unknown-tool", priority=1),
+        ],
+        focus_directories=["src", "missing"],
+        priority_functions=["parseImage", "missingFunc"],
+        parser_entries=["decode", "notRealParser"],
+        dynamic_priority_functions=["parseImage", "notRealDynamic"],
+        confirmed_high_risk=[
+            {"file": ".github/workflows/ci.yml", "function": "", "reason": "do not promote config"},
+            {"file": "src/parser.cpp", "function": "missingFunc", "reason": "unknown function"},
+        ],
+        dismissed_noise=[{"file": ".github/workflows/ci.yml", "reason": "config lint"}],
+        confidence="high",  # type: ignore[arg-type]
+    )
+
+    validated = MiningDirector(FakeLLM()).validate_strategy(strategy, target, tools, profile, semantic_index)  # type: ignore[arg-type]
+
+    assert [item.name for item in validated.tool_selections] == ["semgrep"]
+    assert validated.focus_directories == ["src"]
+    assert validated.priority_functions == ["parseImage"]
+    assert "decode" in validated.parser_entries
+    assert "parseImage" in validated.dynamic_priority_functions
+    assert validated.dismissed_noise == [{"file": ".github/workflows/ci.yml", "reason": "config lint"}]
+    assert validated.confirmed_high_risk == []
+    rejected = {(item["kind"], item["value"]) for item in validated.rejected_strategy_items}
+    assert ("tool", "cppcheck") in rejected
+    assert ("tool", "unknown-tool") in rejected
+    assert ("focus_directory", "missing") in rejected
+    assert ("priority_function", "missingFunc") in rejected
+    assert ("confirmed_high_risk", ".github/workflows/ci.yml") in rejected
+    assert validated.confidence == 0.8
+
+
+def test_mining_director_fallback_strategy_is_not_empty(tmp_path: Path):
+    class BrokenLLM:
+        def chat(self, *_args, **_kwargs):
+            raise RuntimeError("llm down")
+
+    target = tmp_path / "repo"
+    (target / "src").mkdir(parents=True)
+    profile = ProjectProfile(root=str(target), languages={"Python": 1})
+    tools = [ToolAvailability("semgrep", "semgrep", True, False, "static-analysis")]
+
+    strategy = MiningDirector(BrokenLLM()).formulate_strategy(target, profile, SemanticIndex(), tools)  # type: ignore[arg-type]
+
+    assert strategy.validated is True
+    assert strategy.tool_selections
+    assert strategy.focus_directories == ["src"]
+
+
+def test_mining_director_prioritizes_candidates_and_adds_hints():
+    director = MiningDirector(FakeLLM())  # type: ignore[arg-type]
+    strategy = MiningStrategy(
+        focus_directories=["src"],
+        priority_functions=["parseImage"],
+        parser_entries=["parse"],
+        dynamic_priority_functions=["parseImage"],
+        verification_hints={"parseImage": {"runtime_type": "cpp_harness", "oracle": "asan crash"}},
+    )
+    boring = VulnerabilityCandidate(
+        id="candidate-b",
+        slice_id="slice-b",
+        title="boring",
+        vulnerability_type="other",
+        severity="low",
+        file_path="docs/readme.md",
+        line_start=1,
+        description="boring",
+        function_name="readme",
+        confidence=0.9,
+    )
+    parser = VulnerabilityCandidate(
+        id="candidate-a",
+        slice_id="slice-a",
+        title="parser overflow",
+        vulnerability_type="buffer_overflow",
+        severity="high",
+        file_path="src/parser.cpp",
+        line_start=10,
+        description="parser",
+        function_name="parseImage",
+        confidence=0.5,
+    )
+
+    ordered = director.prioritize_candidates([boring, parser], strategy, ProjectProfile(root="", languages={"C++": 1}))
+
+    assert ordered[0].id == "candidate-a"
+    assert ordered[0].director_priority > ordered[1].director_priority
+    assert "priority_function:parseImage" in ordered[0].director_reason
+    assert ordered[0].verification_hint["runtime_type"] == "cpp_harness"
+
+
+def test_mining_debug_and_report_include_director_strategy(tmp_path: Path):
+    strategy = MiningStrategy(
+        tool_selections=[ToolSelection(name="semgrep", priority=1)],
+        focus_directories=["src"],
+        priority_functions=["parseImage"],
+        rejected_strategy_items=[{"kind": "tool", "value": "cppcheck", "reason": "tool is unavailable"}],
+        strategy_effects={"candidate_top_after": ["candidate-1"]},
+    )
+    mining_result = MiningResult(
+        dangerous_functions=[
+            DangerousFunction(
+                id="df-source",
+                file_path="src/parser.cpp",
+                line_start=1,
+                function_name="parseImage",
+                dangerous_api="memcpy",
+                category="memory",
+                snippet="memcpy(dst, src, len)",
+                risk_domain="source_code",
+            ),
+            DangerousFunction(
+                id="df-config",
+                file_path=".github/workflows/build.yml",
+                line_start=3,
+                function_name="",
+                dangerous_api="mutable_action_ref",
+                category="configuration",
+                snippet="uses: vendor/action@main",
+                risk_domain="supply_chain_config",
+            ),
+        ],
+        candidates=[
+            VulnerabilityCandidate(
+                id="candidate-1",
+                slice_id="slice-1",
+                title="candidate",
+                vulnerability_type="buffer_overflow",
+                severity="high",
+                file_path="src/parser.cpp",
+                line_start=1,
+                description="candidate",
+            )
+        ],
+        aggregated_candidates=[],
+        findings=[],
+        strategy=strategy.to_dict(),
+        strategy_effects=strategy.strategy_effects,
+    )
+
+    debug = generate_mining_debug(mining_result)
+
+    assert debug["validated_strategy"]["focus_directories"] == ["src"]
+    assert debug["rejected_strategy_items"][0]["value"] == "cppcheck"
+    assert debug["strategy_effects"]["candidate_top_after"] == ["candidate-1"]
+    assert debug["anchor_count_by_risk_domain"] == {"source_code": 1, "supply_chain_config": 1}
+
+    report = AuditReport(
+        input_source=InputSource(original="local", kind="local", local_path=str(tmp_path)),
+        target=str(tmp_path),
+        created_at="now",
+        profile=ProjectProfile(root=str(tmp_path), languages={"C++": 1}),
+        semantic_index=SemanticIndex(),
+        tool_results=[],
+        dangerous_functions=[],
+        program_slices=[],
+        candidates=[],
+        findings=[],
+        verification_results=[],
+        mining_strategy=strategy.to_dict(),
+    )
+
+    markdown = ReportWriter()._to_markdown(report)
+
+    assert "## MiningDirector 策略" in markdown
+    assert "被拒绝的策略项" in markdown
+    assert "candidate-1" in markdown
+
+
+def test_weak_cpp_rule_without_strong_condition_is_invalid(tmp_path: Path):
+    target = tmp_path / "native"
+    target.mkdir()
+    (target / "main.cpp").write_text(
+        "int f(const char *a, const char *b) {\n    return memcmp(a, b, 4);\n}\n",
+        encoding="utf-8",
+    )
+
+    dangerous = DangerousFunctionLocator().locate(target, [], AuditBudget.for_mode("standard"))
+    slices = SliceAnalyzer().analyze(target, dangerous, SemanticIndex(), FakeLLM(), AuditBudget.for_mode("standard"))  # type: ignore[arg-type]
+    candidates = CandidateGenerator().generate(slices, FakeLLM(), AuditBudget.for_mode("standard"))  # type: ignore[arg-type]
+
+    assert candidates
+    assert all(candidate.validity == "invalid_candidate" for candidate in candidates)
+    assert ClueAggregator().aggregate(candidates) == []
 
 
 def test_invalid_candidate_is_not_aggregated():
@@ -1182,6 +1594,188 @@ def _phase5_finding(vuln_type: str = "command_injection", file_path: str = "app.
     )
 
 
+def test_phase5_static_verifier_uses_trace_and_constrains_llm(tmp_path: Path):
+    source = tmp_path / "app.py"
+    source.write_text("def handler(value):\n    return os.system(value)\n", encoding="utf-8")
+    finding = _phase5_finding()
+    finding.line_start = 2
+    finding.risk_domain = "source_code"
+    finding.candidate_id = "candidate-1"
+    finding.slice_id = "slice-1"
+    finding.dangerous_function_id = "danger-1"
+    candidate = VulnerabilityCandidate(
+        id="candidate-1",
+        slice_id="slice-1",
+        title="command injection",
+        vulnerability_type="command_injection",
+        severity="high",
+        file_path="app.py",
+        line_start=2,
+        description="source reaches shell",
+        source="request.args",
+        sink="os.system",
+    )
+    program_slice = ProgramSlice(
+        id="slice-1",
+        dangerous_function_id="danger-1",
+        file_path="app.py",
+        line_start=2,
+        function_name="handler",
+        source="request.args",
+        sink="os.system",
+        data_flow=["request.args -> value -> os.system"],
+        missing_guards=["shell escaping"],
+    )
+    dangerous = DangerousFunction(
+        id="danger-1",
+        file_path="app.py",
+        line_start=2,
+        function_name="handler",
+        dangerous_api="os.system",
+        sink="os.system",
+        snippet="return os.system(value)",
+        language="Python",
+        category="command",
+        confidence=0.9,
+    )
+
+    class ReviewLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = (
+                '[{"finding_id":"finding-command_injection",'
+                '"verdict":"plausible","reachability":"reachable",'
+                '"reason":"trace is coherent"}]'
+            )
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    verifier = StaticVerifier(ReviewLLM())
+    result = verifier.verify(tmp_path, finding, candidate, program_slice, dangerous, [])
+    verifier.review_batch([finding], [result])
+
+    assert result.static_status == "plausible"
+    assert result.reachability == "reachable"
+    assert result.dynamic_eligible is True
+    assert result.rule_checks["trace_linked"] is True
+    assert result.llm_review["status"] == "completed"
+
+
+def test_phase5_non_source_findings_are_static_only_without_poc(tmp_path: Path):
+    (tmp_path / "requirements.txt").write_text("demo==1.0\n", encoding="utf-8")
+    finding = _phase5_finding("dependency_vulnerability", "requirements.txt")
+    finding.risk_domain = "dependency"
+    profile = ProjectProfile(root=str(tmp_path), languages={"Python": 1})
+    output = tmp_path / "report"
+
+    result = VerificationAgent().verify(tmp_path, [finding], output, profile)[0]
+
+    assert result.status == "static_only"
+    assert result.dynamic_attempted is False
+    assert result.static_verification["static_status"] == "static_only"
+    assert result.dynamic_verification["blocked_reason"] == "risk_domain_static_only"
+    assert not (output / "pocs").exists()
+    assert not (output / "exploits").exists()
+
+
+def test_phase5_dynamic_planner_applies_static_gate_and_precise_block_reason(tmp_path: Path):
+    finding = _phase5_finding("unsafe_memory_copy", "main.cpp")
+    finding.risk_domain = "source_code"
+    profile = ProjectProfile(root=str(tmp_path), languages={"C++": 1})
+    environment = EnvironmentManager().inspect(tmp_path, profile, finding)
+    static_result = StaticVerifier().verify(tmp_path, finding)
+    static_result.static_status = "plausible"
+    static_result.dynamic_eligible = True
+    build = BuildDecision(False, "Native project detected; auto-build is disabled.", status="blocked")
+
+    plan = DynamicPlanner().plan(
+        tmp_path,
+        profile,
+        finding,
+        static_result,
+        environment,
+        build_decision=build,
+    )
+
+    assert plan.runtime_type == "cpp_harness"
+    assert plan.status == "blocked"
+    assert plan.blocked_reason == "build_disabled"
+
+
+def test_phase5_dynamic_planner_validates_llm_tactics(tmp_path: Path):
+    class PlannerLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = (
+                '[{"finding_id":"finding-command_injection",'
+                '"runtime_type":"cpp_cli","build_strategy":"cmake_build",'
+                '"poc_strategy":"malformed_file","oracle":"asan_crash",'
+                '"rationale":"try an incompatible native strategy"}]'
+            )
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    finding = _phase5_finding()
+    finding.risk_domain = "source_code"
+    profile = ProjectProfile(root=str(tmp_path), languages={"Python": 1})
+    environment = EnvironmentManager().inspect(tmp_path, profile, finding)
+    static_result = StaticVerifier().verify(tmp_path, finding)
+    static_result.static_status = "plausible"
+    static_result.dynamic_eligible = True
+    planner = DynamicPlanner(PlannerLLM())
+    plan = planner.plan(tmp_path, profile, finding, static_result, environment)
+
+    planner.review_batch(profile, [(finding, static_result, environment, plan)])
+
+    assert plan.runtime_type == "python_test"
+    assert plan.build_strategy == "no_build_required"
+    assert plan.poc_strategy == "unit_test"
+    assert plan.oracle == "stderr_marker"
+    assert set(plan.planner_review["rejected_fields"]) >= {
+        "runtime_type",
+        "build_strategy",
+        "poc_strategy",
+        "oracle",
+    }
+
+
+def test_phase5_dynamic_budget_executes_only_topk(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.agents.verification as verification_module
+
+    monkeypatch.setattr(
+        verification_module.shutil,
+        "which",
+        lambda name: None if name == "docker" else sys.executable,
+    )
+    findings = []
+    for index in range(3):
+        path = tmp_path / f"app{index}.py"
+        path.write_text("import os\ndef handler(value):\n    return os.system(value)\n", encoding="utf-8")
+        finding = _phase5_finding("command_injection", path.name)
+        finding.id = f"finding-{index}"
+        finding.line_start = 3
+        finding.risk_domain = "source_code"
+        finding.director_priority = 10 - index
+        findings.append(finding)
+
+    results = VerificationAgent().verify(
+        tmp_path,
+        findings,
+        tmp_path / "report",
+        ProjectProfile(root=str(tmp_path), languages={"Python": 1}),
+        strategy={"validated": True},
+        max_dynamic_verifications=1,
+    )
+
+    assert sum(1 for item in results if item.dynamic_attempted) == 1
+    assert sum(
+        1
+        for item in results
+        if item.dynamic_verification.get("blocked_reason") == "dynamic_budget_exhausted"
+    ) == 2
+    assert len(list((tmp_path / "report" / "pocs").iterdir())) == 1
+
+
 def test_phase5_environment_manager_identifies_project_shapes(tmp_path: Path, monkeypatch):
     import agentic_code_audit.agents.verification as verification_module
 
@@ -1234,22 +1828,24 @@ def test_phase5_runtime_manager_selects_expected_runtime_types(tmp_path: Path):
 
 
 def test_phase5_build_manager_blocks_missing_native_tools(tmp_path: Path, monkeypatch):
-    import agentic_code_audit.agents.verification as verification_module
-
-    monkeypatch.setattr(verification_module.shutil, "which", lambda _name: None)
     (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
     finding = _phase5_finding("unsafe_memory_copy", "main.cpp")
     profile = ProjectProfile(root=str(tmp_path), languages={"C++": 1})
     env = EnvironmentManager().inspect(tmp_path, profile, finding)
 
-    decision, executable = BuildManager().prepare(tmp_path, profile, finding, env, tmp_path / "out")
+    manager = BuildManager()
+    monkeypatch.setattr(manager, "_sandbox_reachable", lambda: True)
+    monkeypatch.setattr(manager, "_sandbox_has_any_tool", lambda _tools: False)
+    decision, executable = manager.prepare(
+        tmp_path, profile, finding, env, tmp_path / "out", auto_build_native=True
+    )
     assert executable is None
     assert decision.status == "blocked"
     assert decision.missing_tools
     assert decision.install_hints
 
 
-def test_phase5_sandbox_executor_records_local_fallback_artifacts(tmp_path: Path, monkeypatch):
+def test_phase6_sandbox_executor_blocks_without_docker_and_records_artifacts(tmp_path: Path, monkeypatch):
     import agentic_code_audit.agents.verification as verification_module
 
     monkeypatch.setattr(verification_module.shutil, "which", lambda name: None if name == "docker" else sys.executable)
@@ -1263,11 +1859,43 @@ def test_phase5_sandbox_executor_records_local_fallback_artifacts(tmp_path: Path
     )
 
     outcome = SandboxExecutor().execute(plan, tmp_path / "sandbox")
-    assert outcome.local_fallback is True
-    assert outcome.status in {"verified", "partially_verified"}
+    assert outcome.local_fallback is False
+    assert outcome.status == "blocked"
+    assert outcome.checker_details["blocked_reason"] == "missing_docker"
     assert (tmp_path / "sandbox" / "command.json").exists()
     assert (tmp_path / "sandbox" / "stdout.log").exists()
     assert any(path.name == "changed_files.json" for path in outcome.artifact_paths)
+
+
+def test_phase6_verification_container_is_networkless_and_limited(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.agents.verification as verification_module
+
+    class Completed:
+        returncode = 0
+        stdout = "[DETECTED] command injection sentinel\n"
+        stderr = ""
+
+    monkeypatch.setattr(verification_module.shutil, "which", lambda name: "docker" if name == "docker" else None)
+    monkeypatch.setattr(verification_module.subprocess, "run", lambda *_args, **_kwargs: Completed())
+    executor = SandboxExecutor(compose_container="audit-sandbox")
+    monkeypatch.setattr(executor, "_container_running", lambda _docker: True)
+    plan = HarnessPlan(
+        method="test harness",
+        language="python",
+        script='print("[DETECTED] command injection sentinel")\n',
+        command=["python", "/workspace/harness.py"],
+        oracle="marker",
+        explanation="unit test",
+    )
+
+    outcome = executor.execute(plan, tmp_path / "sandbox")
+
+    assert outcome.status == "verified"
+    assert outcome.sandbox_command[:3] == ["docker", "run", "--rm"]
+    assert outcome.sandbox_command[outcome.sandbox_command.index("--network") + 1] == "none"
+    assert outcome.sandbox_command[outcome.sandbox_command.index("--memory") + 1] == "1g"
+    assert outcome.sandbox_command[outcome.sandbox_command.index("--cpus") + 1] == "1"
+    assert outcome.sandbox_command[outcome.sandbox_command.index("--volumes-from") + 1] == "audit-sandbox"
 
 
 def test_phase5_checkers_require_real_oracle_evidence():
@@ -1329,7 +1957,13 @@ def test_phase5_verification_to_store_persistence_end_to_end(tmp_path: Path, mon
     assert result.execution
     assert result.evidence_artifact_ids
     assert result.exploit_artifact_ids
-    assert result.local_fallback is True
+    assert result.local_fallback is False
+    assert result.status == "blocked"
+    assert result.blocked_reason == "missing_docker"
+    assert result.static_verification["static_status"] == "plausible"
+    assert result.dynamic_verification["status"] == "planned"
+    assert result.checker_verdict["status"] == result.status
+    assert result.dynamic_attempted is True
 
     store = AuditStore(tmp_path / "audit.sqlite3")
     task_id = store.create_task(str(target), "full", "deepseek-v4-pro", "", False)
@@ -1357,3 +1991,346 @@ def test_phase5_verification_to_store_persistence_end_to_end(tmp_path: Path, mon
     assert detail["verification"]["runtime_type"] == "python_test"
     assert detail["verification"]["evidence_artifact_ids"]
     assert detail["verification"]["exploit_artifact_ids"]
+    assert detail["verification"]["static_verification"]["static_status"] == "plausible"
+    assert detail["verification"]["dynamic_verification"]["status"] == "planned"
+    assert detail["verification"]["checker_verdict"]["status"] == result.status
+
+
+def test_phase6_mining_director_list_directory_records_success_and_errors(tmp_path: Path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+    director = MiningDirector(FakeLLM())  # type: ignore[arg-type]
+    director._exploration_tools = CodeExplorationTools(tmp_path)
+
+    assert "[D] src" in director._tool_list_directory(".")
+    assert director._tool_list_directory("missing").startswith("[ERROR]")
+    assert director._tool_list_directory("../outside").startswith("[ERROR]")
+    assert [item["success"] for item in director._exploration_tools.log] == [True, False, False]
+
+
+def test_phase6_static_verifier_keeps_non_direct_sink_as_weak(tmp_path: Path):
+    (tmp_path / "app.py").write_text(
+        "import os\n\ndef handler():\n    return os.system('fixed')\n",
+        encoding="utf-8",
+    )
+    finding = _phase5_finding()
+    finding.code_snippet = "return os.system('fixed')"
+
+    result = StaticVerifier().verify(tmp_path, finding)
+
+    assert result.static_status == "weak_static_proof"
+    assert result.rule_checks["direct_parameter_to_sink"] is False
+
+
+def test_phase6_tool_availability_is_shared_with_planner(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.tools.runner as runner_module
+
+    class Completed:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    runner = ToolRunner(make_settings(), sandbox_container="audit-sandbox")
+    monkeypatch.setattr(runner, "_sandbox_available", lambda: True)
+
+    def fake_run(command, **_kwargs):
+        if "which" in command:
+            return Completed(stdout="/usr/bin/cppcheck\n")
+        return Completed(stdout="Cppcheck 2.14\n")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    availability = runner.check_tool("cppcheck")
+    assert runner.registry.get("ctags").capability == "code-navigation"
+    planner = ToolPlanner(
+        runner.registry,
+        runner.env,
+        availability_provider=lambda: [availability],
+    )
+    (tmp_path / "main.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+    profile = ProjectProfile(root=str(tmp_path), languages={"C++": 1})
+    recommendations = planner.recommend_tools(
+        "VulnerabilityMiningAgent", "mine_vulnerabilities", profile, tmp_path
+    )
+
+    cppcheck = next(item for item in recommendations if item.name == "cppcheck")
+    assert cppcheck.available is True
+    assert availability.execution_location == "sandbox"
+    assert availability.container == "audit-sandbox"
+    assert availability.network_policy == "none"
+
+
+def test_phase7_native_build_authorization_precedes_sandbox_capability(tmp_path: Path, monkeypatch):
+    (tmp_path / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+    profile = ProjectProfile(root=str(tmp_path), languages={"C++": 1})
+    finding = _phase5_finding("unsafe_memory_copy", "main.cpp")
+    environment = EnvironmentManager().inspect(tmp_path, profile, finding)
+    manager = BuildManager()
+    monkeypatch.setattr(manager, "_sandbox_reachable", lambda: True)
+    monkeypatch.setattr(manager, "_sandbox_has_any_tool", lambda _tools: True)
+
+    decision, executable = manager.prepare(
+        tmp_path, profile, finding, environment, tmp_path / "out", auto_build_native=False
+    )
+
+    assert executable is None
+    assert decision.blocked_reason == "build_disabled"
+    assert decision.should_attempt is False
+
+
+def test_phase7_build_failure_reasons_are_stable():
+    offline = BuildManager(build_network_enabled=False)
+    assert offline._classify_build_failure("", "Could not resolve host: example.test") == "network_disabled"
+    assert offline._classify_build_failure("", "Could NOT find ZLIB (missing: ZLIB_LIBRARY)") == "missing_dependency"
+    assert offline._classify_build_failure("", "compiler terminated") == "build_failed"
+
+
+def test_phase8_openvpn_like_project_prefers_autotools_over_cmake(tmp_path: Path):
+    (tmp_path / "CMakeLists.txt").write_text('message(FATAL_ERROR "On Unix use autoconfig")\n', encoding="utf-8")
+    (tmp_path / "configure.ac").write_text("AC_INIT([demo], [1.0])\n", encoding="utf-8")
+    (tmp_path / "Makefile.am").write_text("bin_PROGRAMS = demo\n", encoding="utf-8")
+    profile = ProjectProfile(root=str(tmp_path), languages={"C": 1})
+    finding = _phase5_finding("unsafe_c_string_api", "src/misc.c")
+
+    environment = EnvironmentManager().inspect(tmp_path, profile, finding)
+
+    assert environment.build_systems[:2] == ["autotools", "cmake"]
+
+
+def test_phase8_cmake_wrong_build_system_reason_is_stable():
+    manager = BuildManager(build_network_enabled=False)
+    assert manager._classify_build_failure("", "CMake is only used for Windows; use autoconfig on Unix") == "wrong_build_system"
+
+
+def test_phase8_dynamic_planner_accepts_structured_recipe(tmp_path: Path):
+    class PlannerLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = json.dumps(
+                [
+                    {
+                        "finding_id": "finding-command_injection",
+                        "runtime_type": "python_test",
+                        "build_strategy": "no_build_required",
+                        "poc_strategy": "unit_test",
+                        "oracle": "stderr_marker",
+                        "rationale": "call the function with a sentinel payload",
+                        "verification_recipe": {
+                            "target_function": "run",
+                            "source": "request.args",
+                            "sink": "subprocess",
+                            "preconditions": ["payload reaches command string"],
+                            "preferred_build": "no_build_required",
+                            "runtime_entry": "python_test",
+                            "fallback_harness": "pytest-style unit harness",
+                            "micro_proof": "direct subprocess sentinel proof",
+                            "oracle": "stderr_marker",
+                            "expected_signal": "sentinel in stderr",
+                            "limitations": ["no service runtime"],
+                        },
+                    }
+                ]
+            )
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    finding = _phase5_finding()
+    finding.risk_domain = "source_code"
+    profile = ProjectProfile(root=str(tmp_path), languages={"Python": 1})
+    environment = EnvironmentManager().inspect(tmp_path, profile, finding)
+    static_result = StaticVerifier().verify(tmp_path, finding)
+    static_result.static_status = "plausible"
+    static_result.dynamic_eligible = True
+    planner = DynamicPlanner(PlannerLLM())
+    plan = planner.plan(tmp_path, profile, finding, static_result, environment)
+
+    planner.review_batch(profile, [(finding, static_result, environment, plan)])
+
+    assert plan.verification_recipe["source_kind"] == "llm_review"
+    assert plan.verification_recipe["target_function"] == "run"
+    assert "verification_recipe" in plan.planner_review["accepted_fields"]
+
+
+def test_phase8_blocked_runtime_uses_partial_proof_without_verified_status(tmp_path: Path):
+    class FakeSandbox:
+        def execute(self, harness, work_dir):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            return CheckerOutcome(
+                status="verified",
+                summary="marker matched",
+                stdout_excerpt="[DETECTED] partial dynamic proof",
+                stderr_excerpt="",
+                exit_code=0,
+                sandbox_command=["docker", "run", "--network", "none", "sh", "/workspace/harness.sh"],
+                artifact_paths=[work_dir / "harness.sh"],
+                execution={"command": ["docker", "run"], "exit_code": 0},
+                checker_details={"checker": "SandboxExecutor"},
+            )
+
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.risk_domain = "source_code"
+    profile = ProjectProfile(root=str(tmp_path), languages={"C": 1})
+    environment = EnvironmentManager().inspect(tmp_path, profile, finding)
+    static_result = StaticVerifier().verify(tmp_path, finding)
+    static_result.static_status = "plausible"
+    static_result.dynamic_eligible = True
+    dynamic_plan = DynamicPlanner().plan(
+        tmp_path,
+        profile,
+        finding,
+        static_result,
+        environment,
+        build_decision=BuildDecision(True, "build failed", build_system="autotools", status="blocked", blocked_reason="build_failed"),
+    )
+    poc_dir = tmp_path / "poc"
+    poc_dir.mkdir()
+    poc_plan = PocPlan(
+        finding=finding,
+        analysis=PocAnalysis("valid", "cpp_harness", "asan_crash", "details"),
+        poc_dir=poc_dir,
+        poc_path=poc_dir / "poc_input.bin",
+    )
+
+    outcome = RuntimeManager(sandbox=FakeSandbox()).execute_plan(
+        tmp_path,
+        profile,
+        poc_plan,
+        dynamic_plan,
+        "",
+        VerificationPlanner(),
+    )
+
+    assert outcome.status == "partial_dynamic_proof"
+    assert outcome.status != "verified"
+    assert outcome.checker_details["proof_level"] == "micro_proof"
+    assert outcome.checker_details["fallback_attempts"][0]["status"] == "partial_dynamic_proof"
+
+
+def test_phase7_cmake_build_uses_ephemeral_offline_container(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.agents.verification as verification_module
+
+    class Completed:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if "cmake --build" in command[-1]:
+            executable = tmp_path / ".agentic-build" / "bin" / "exiv2"
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_bytes(b"\x7fELFfixture")
+        return Completed()
+
+    monkeypatch.setattr(verification_module.subprocess, "run", fake_run)
+    manager = BuildManager(
+        sandbox_container="audit-sandbox",
+        sandbox_image="audit-sandbox:local",
+        build_network_enabled=False,
+    )
+    decision, executable = manager._build_cmake(tmp_path, tmp_path / "report")
+
+    assert decision.status == "ready"
+    assert executable is not None
+    assert len(decision.execution) == 2
+    assert all(call[call.index("--network") + 1] == "none" for call in calls)
+    assert all(call[call.index("--volumes-from") + 1] == "audit-sandbox" for call in calls)
+
+
+def test_phase7_native_executable_priority_paths(tmp_path: Path):
+    executable = tmp_path / ".agentic-build" / "bin" / "exiv2"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"\x7fELFfixture")
+
+    assert PocGenerator()._find_native_executable(tmp_path) == executable
+
+
+def test_phase7_director_strategy_is_merged_into_dynamic_plan(tmp_path: Path):
+    finding = _phase5_finding("unsafe_memory_copy", "main.cpp")
+    finding.function_name = "parseImage"
+    strategy = MiningStrategy(
+        build_attempt=True,
+        harness_candidates=["parseImage"],
+        parser_entries=["parseImage"],
+        suggested_oracles={"parseImage": "asan_crash"},
+    )
+    hint = VerificationAgent._director_hint_for_finding(finding, strategy)
+    static = type(
+        "StaticResult",
+        (),
+        {"risk_domain": "source_code", "static_status": "plausible", "dynamic_eligible": True},
+    )()
+    profile = ProjectProfile(root=str(tmp_path), languages={"C++": 1})
+    environment = EnvironmentManager().inspect(tmp_path, profile, finding)
+    plan = DynamicPlanner().plan(
+        tmp_path,
+        profile,
+        finding,
+        static,
+        environment,
+        build_decision=BuildDecision(
+            False, "disabled", build_system="cmake", status="blocked", blocked_reason="build_disabled"
+        ),
+        director_hint=hint,
+    )
+
+    assert plan.director_hint["build_attempt"] is True
+    assert plan.director_hint["harness_candidate"] == "parseImage"
+    assert plan.director_hint["parser_entries"] == ["parseImage"]
+    assert plan.oracle == "asan_crash"
+
+
+def test_phase7_task_native_build_flag_reaches_start_payload(tmp_path: Path, monkeypatch):
+    import agentic_code_audit.server as server_module
+
+    store = AuditStore(tmp_path / "api.sqlite3")
+    monkeypatch.setattr(server_module, "STORE", store)
+    monkeypatch.setattr(server_module.Settings, "load", classmethod(lambda _cls, _root=None: make_settings()))
+    captured: dict[str, object] = {}
+
+    def fake_run(task_id: str, payload: dict[str, object]) -> None:
+        captured.update({"task_id": task_id, **payload})
+
+    monkeypatch.setattr(server_module, "_run_task_threaded", fake_run)
+    client = TestClient(server_module.app)
+    created = client.post(
+        "/api/tasks",
+        json={"target": str(tmp_path), "mode": "standard", "enable_native_build": True},
+    ).json()
+    response = client.post(f"/api/tasks/{created['task_id']}/start")
+
+    assert response.status_code == 200
+    assert store.get_task(created["task_id"])["enable_native_build"] is True
+    assert captured["enable_native_build"] is True
+
+
+def test_phase6_pipeline_writes_debug_from_report_payload(tmp_path: Path):
+    report = AuditReport(
+        input_source=InputSource(original=str(tmp_path), kind="local", local_path=str(tmp_path)),
+        target=str(tmp_path),
+        created_at="2026-01-01T00:00:00+00:00",
+        profile=ProjectProfile(root=str(tmp_path)),
+        semantic_index=SemanticIndex(),
+        tool_results=[],
+        dangerous_functions=[],
+        program_slices=[],
+        candidates=[],
+        findings=[],
+        verification_results=[],
+        mining_debug={"candidate_validity_breakdown": {"total": 7}},
+    )
+
+    class FakeOrchestrator:
+        def run(self, *_args, **kwargs):
+            assert kwargs["enable_native_build"] is True
+            return report
+
+    pipeline = object.__new__(AuditPipeline)
+    pipeline.orchestrator = FakeOrchestrator()
+    pipeline.report_writer = ReportWriter()
+    artifacts = pipeline.run(tmp_path, tmp_path / "report", enable_native_build=True)
+
+    assert artifacts.debug_path.exists()
+    assert json.loads(artifacts.debug_path.read_text(encoding="utf-8")) == report.mining_debug

@@ -48,6 +48,7 @@ RUN set -eux; \
       rustc \
       cargo \
       sqlite3 \
+      universal-ctags \
       unzip \
       valgrind \
     && rm -rf /var/lib/apt/lists/*

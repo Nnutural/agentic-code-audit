@@ -43,6 +43,7 @@ class TaskRecord:
     llm_model: str = "deepseek-v4-pro"
     model: str = ""
     runtime_url: str = ""
+    enable_native_build: bool = False
     current_agent: str = ""
     current_phase: str = ""
     progress_done: int = 0
@@ -51,6 +52,7 @@ class TaskRecord:
     json_report: str = ""
     markdown_report: str = ""
     error: str = ""
+    budget: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now)
     started_at: str | None = None
     finished_at: str | None = None
@@ -226,6 +228,11 @@ class DangerousFunction:
     tool_run_refs: list[str] = field(default_factory=list)
     artifact_refs: list[str] = field(default_factory=list)
     tool: str = "dangerous-function-locator"
+    rule_vuln_type: str = ""
+    anchor_category: str = ""
+    risk_domain: str = ""
+    weak_signal: bool = False
+    optional_tools_not_run: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -252,6 +259,11 @@ class ProgramSlice:
     context: str = ""
     code_excerpt: str = ""
     llm_summary: str = ""
+    rule_vuln_type: str = ""
+    anchor_kind: str = ""
+    anchor_category: str = ""
+    anchor_tool: str = ""
+    anchor_confidence: float = 0.0
 
 
 @dataclass
@@ -277,6 +289,22 @@ class VulnerabilityCandidate:
     valid: bool = True
     validity: str = "valid"
     llm_reasoning: str = ""
+    candidate_source: str = "llm"  # "tool" | "rule" | "llm"
+    invalid_reason: str = ""
+    risk_domain: str = ""
+    director_priority: int = 0
+    director_reason: str = ""
+    verification_hint: dict[str, Any] = field(default_factory=dict)
+
+    def mark_valid(self) -> None:
+        self.validity = "valid"
+        self.valid = True
+        self.invalid_reason = ""
+
+    def mark_invalid(self, reason: str) -> None:
+        self.validity = "invalid_candidate"
+        self.valid = False
+        self.invalid_reason = reason or "invalid_candidate"
 
 
 @dataclass
@@ -318,6 +346,10 @@ class Finding:
     artifact_refs: list[str] = field(default_factory=list)
     chain_graph: ChainGraph = field(default_factory=ChainGraph)
     chinese_summary: str = ""
+    risk_domain: str = ""
+    director_priority: int = 0
+    director_reason: str = ""
+    verification_hint: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -361,6 +393,15 @@ class VerificationResult:
     sandbox_stderr: str = ""
     artifact_ids: list[str] = field(default_factory=list)
     artifact_records: list[ArtifactRecord] = field(default_factory=list)
+    static_verification: dict[str, Any] = field(default_factory=dict)
+    dynamic_verification: dict[str, Any] = field(default_factory=dict)
+    checker_verdict: dict[str, Any] = field(default_factory=dict)
+    dynamic_attempted: bool = False
+    blocked_reason: str = ""
+    verification_recipe: dict[str, Any] = field(default_factory=dict)
+    proof_level: str = "none"
+    validation_tags: list[dict[str, Any]] = field(default_factory=list)
+    fallback_attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -402,11 +443,17 @@ class AuditReport:
     candidates: list[VulnerabilityCandidate]
     findings: list[Finding]
     verification_results: list[VerificationResult]
+    aggregated_candidates: list[VulnerabilityCandidate] = field(default_factory=list)
     agent_events: list[AgentEvent] = field(default_factory=list)
     llm_enabled: bool = False
     llm_required: bool = True
     llm_provider: str = "deepseek"
     llm_model: str = "deepseek-v4-pro"
+    mode: str = "standard"
+    budget: dict[str, Any] = field(default_factory=dict)
+    budget_usage: dict[str, Any] = field(default_factory=dict)
+    mining_strategy: dict[str, Any] = field(default_factory=dict)
+    mining_debug: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

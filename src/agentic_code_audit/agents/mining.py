@@ -3,14 +3,20 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..audit_budget import AuditBudget, BudgetUsage
 from ..llm import DeepSeekClient
+from ..normalizer import VulnerabilityTypeNormalizer
+from ..vulnerability_types import VulnType, RiskDomain, risk_domain_for, is_dynamic_verification_candidate
+from .mining_director import MiningStrategy
 from ..models import (
     AgentEvent,
     ChainEdge,
@@ -27,7 +33,44 @@ from ..models import (
     utc_now,
 )
 from ..rules import RulesLoader
-from ..tools.runner import SecurityToolRunner, ToolPlanner, ToolRunner
+from ..tools.runner import SecurityToolRunner, ToolPlanner, ToolRunner, run_invocations_parallel
+
+
+WEAK_CPP_APIS = {
+    "array_index",
+    "array_index_offset",
+    "c_style_cast",
+    "open",
+    "mmap",
+    "fopen",
+    "new[]",
+    "malloc",
+    "calloc",
+    "realloc",
+    "free",
+    "delete",
+    "delete[]",
+    "memcmp",
+    "std::copy",
+    "copy",
+}
+
+
+def coerce_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    if isinstance(value, dict):
+        return [json.dumps(value, ensure_ascii=False)]
+    if isinstance(value, (list, tuple, set)):
+        output: list[str] = []
+        for item in value:
+            output.extend(coerce_str_list(item))
+        return output
+    return [str(value)]
 
 
 @dataclass
@@ -39,6 +82,10 @@ class MiningResult:
     aggregated_candidates: list[VulnerabilityCandidate] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     events: list[AgentEvent] = field(default_factory=list)
+    strategy: dict[str, Any] | None = None
+    budget: dict[str, Any] = field(default_factory=dict)
+    budget_usage: dict[str, Any] = field(default_factory=dict)
+    strategy_effects: dict[str, Any] = field(default_factory=dict)
 
 
 class DangerousFunctionLocator:
@@ -69,14 +116,24 @@ class DangerousFunctionLocator:
 
     def __init__(self, rules_loader: RulesLoader | None = None) -> None:
         self.rules_loader = rules_loader or RulesLoader()
+        self.normalizer = VulnerabilityTypeNormalizer()
+        self.last_suppressed_counts: dict[str, int] = {}
 
-    def locate(self, target: Path, tool_results: list[ToolResult]) -> list[DangerousFunction]:
+    def locate(
+        self,
+        target: Path,
+        tool_results: list[ToolResult],
+        budget: AuditBudget | None = None,
+        strategy: MiningStrategy | None = None,
+    ) -> list[DangerousFunction]:
         rules = self.rules_loader.load()
         boundary_hints = self._boundary_hints(target)
         skipped_optional = [item.tool for item in tool_results if item.status == "skipped"]
         anchors = self._from_rules(target, rules, boundary_hints, skipped_optional)
-        anchors.extend(self._from_tools(target, tool_results))
-        return self._merge(anchors)
+        anchors.extend(self._from_tools(target, tool_results, boundary_hints))
+        merged = self._merge([self._enrich_anchor(anchor) for anchor in anchors])
+        filtered = self._filter_and_rank(merged, budget, strategy)
+        return filtered[: budget.max_anchors] if budget else filtered
 
     def _from_rules(
         self,
@@ -86,25 +143,36 @@ class DangerousFunctionLocator:
         skipped_optional: list[str],
     ) -> list[DangerousFunction]:
         anchors: list[DangerousFunction] = []
+        # Merge dangerous_functions + sinks for C/C++ rule set
+        cpp_func_rules = list(rules.get("cpp.dangerous_functions", {}).get("rules") or [])
+        cpp_sink_rules = list(rules.get("cpp.sinks", {}).get("rules") or [])
+        cpp_merged = cpp_func_rules + cpp_sink_rules
         grouped_rules = {
             ".py": list(rules.get("python.dangerous_apis", {}).get("rules") or []),
             ".js": list(rules.get("javascript.dangerous_apis", {}).get("rules") or []),
             ".jsx": list(rules.get("javascript.dangerous_apis", {}).get("rules") or []),
             ".ts": list(rules.get("javascript.dangerous_apis", {}).get("rules") or []),
             ".tsx": list(rules.get("javascript.dangerous_apis", {}).get("rules") or []),
-            ".c": list(rules.get("cpp.dangerous_functions", {}).get("rules") or []),
-            ".cc": list(rules.get("cpp.dangerous_functions", {}).get("rules") or []),
-            ".cpp": list(rules.get("cpp.dangerous_functions", {}).get("rules") or []),
-            ".cxx": list(rules.get("cpp.dangerous_functions", {}).get("rules") or []),
-            ".h": list(rules.get("cpp.dangerous_functions", {}).get("rules") or []),
-            ".hpp": list(rules.get("cpp.dangerous_functions", {}).get("rules") or []),
+            ".c": cpp_merged,
+            ".cc": cpp_merged,
+            ".cpp": cpp_merged,
+            ".cxx": cpp_merged,
+            ".h": cpp_merged,
+            ".hpp": cpp_merged,
         }
+        # Load parser entry patterns for C/C++ projects
+        parser_patterns = rules.get("cpp.parser_patterns", {})
         common_rules = [
             {"pattern": pattern, "api": api, "vuln_type": vuln_type, "category": category, "confidence": confidence}
             for pattern, api, vuln_type, category, confidence in self.COMMON_PATTERNS
         ]
+        # Directories to skip during anchor collection (test code, build artifacts)
+        SKIP_DIRS = {"tests", "test", "__tests__", "__test__", "testing", "fuzz", "build", ".git"}
         for path in target.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in self.SUFFIX_LANGUAGE or ".git" in path.parts:
+                continue
+            # Skip test/build directories
+            if any(d in SKIP_DIRS for d in path.parts):
                 continue
             try:
                 lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -140,11 +208,19 @@ class DangerousFunctionLocator:
                             sink=str(rule["api"]),
                             evidence=evidence,
                             tool="rules",
+                            rule_vuln_type=str(rule.get("vuln_type") or ""),
+                            anchor_category=str(rule.get("category") or ""),
+                            weak_signal=bool(rule.get("weak_signal")) or str(rule.get("api") or "") in WEAK_CPP_APIS,
+                            optional_tools_not_run=sorted(set(skipped_optional)),
                         )
                     )
         return anchors
 
-    def _from_tools(self, target: Path, tool_results: list[ToolResult]) -> list[DangerousFunction]:
+    def _from_tools(
+        self, target: Path, tool_results: list[ToolResult],
+        boundary_hints: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> list[DangerousFunction]:
+        hints = boundary_hints or {}
         anchors: list[DangerousFunction] = []
         for result in tool_results:
             if result.tool == "semgrep" and isinstance(result.raw, dict):
@@ -152,7 +228,9 @@ class DangerousFunctionLocator:
             elif result.tool == "bandit" and isinstance(result.raw, dict):
                 anchors.extend(self._bandit_anchors(result))
             elif result.tool == "cppcheck":
-                anchors.extend(self._cppcheck_anchors(target, result))
+                anchors.extend(self._cppcheck_anchors(target, result, hints))
+            elif result.tool == "clang-tidy":
+                anchors.extend(self._clang_tidy_anchors(target, result, hints))
             elif result.tool == "gosec" and isinstance(result.raw, dict):
                 anchors.extend(self._gosec_anchors(target, result))
             elif result.tool in {"npm-audit", "pip-audit", "cargo-audit", "osv-scanner"}:
@@ -246,31 +324,101 @@ class DangerousFunctionLocator:
             )
         return anchors
 
-    def _cppcheck_anchors(self, target: Path, result: ToolResult) -> list[DangerousFunction]:
+    def _cppcheck_anchors(
+        self, target: Path, result: ToolResult,
+        boundary_hints: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> list[DangerousFunction]:
+        hints = boundary_hints or {}
         anchors: list[DangerousFunction] = []
         artifact_refs = self._artifact_refs(result)
         for item in result.findings:
             file_path = self._relative_tool_path(target, str(item.get("location_file") or item.get("file") or ""))
             line = self._int(item.get("location_line") or item.get("line"), 1)
             rule_id = str(item.get("id") or "cppcheck")
+            severity = str(item.get("severity") or "")
+            msg = str(item.get("msg") or "")
+            verbose = str(item.get("verbose") or "")
+            evidence_lines = [msg]
+            if verbose and verbose != msg:
+                evidence_lines.append(verbose)
+            if severity:
+                evidence_lines.insert(0, f"severity={severity}")
+            # Boost confidence for high-severity cppcheck findings
+            confidence = 0.62
+            if severity in {"error", "warning"}:
+                confidence = 0.68
+            if "nullPointer" in rule_id or "bufferAccess" in rule_id or "arrayIndex" in rule_id:
+                confidence = max(confidence, 0.70)
+            fn_name = self._nearest_function(file_path, line, hints)
             anchors.append(
                 DangerousFunction(
                     id=self._id(file_path, line, rule_id),
                     file_path=file_path,
                     line_start=line,
-                    function_name="",
+                    function_name=fn_name,
                     dangerous_api=rule_id,
                     category="tool",
-                    snippet=str(item.get("msg") or item.get("verbose") or "")[:500],
+                    snippet=msg[:500],
                     language="C/C++",
                     kind="tool_finding",
                     rule_id=rule_id,
-                    confidence=0.6,
+                    confidence=confidence,
                     sink=rule_id,
-                    evidence=[str(item.get("msg") or "cppcheck finding")],
+                    evidence=evidence_lines,
                     tool_run_refs=[result.run_id],
                     artifact_refs=artifact_refs,
                     tool="cppcheck",
+                )
+            )
+        return anchors
+
+    def _clang_tidy_anchors(
+        self, target: Path, result: ToolResult,
+        boundary_hints: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> list[DangerousFunction]:
+        """Extract anchors from clang-tidy findings."""
+        hints = boundary_hints or {}
+        anchors: list[DangerousFunction] = []
+        artifact_refs = self._artifact_refs(result)
+        for item in result.findings:
+            file_path = self._relative_tool_path(target, str(item.get("file") or ""))
+            line = self._int(item.get("line"), 1)
+            check_name = str(item.get("check") or "clang-tidy")
+            severity = str(item.get("severity") or "warning")
+            message = str(item.get("message") or "")
+            # Map severity to confidence
+            confidence = 0.65
+            if severity in {"error", "fatal error"}:
+                confidence = 0.75
+            elif severity == "warning":
+                confidence = 0.68
+            elif severity == "note":
+                confidence = 0.50
+            # Security and bugprone checks get higher default confidence
+            if "security" in check_name or "bugprone" in check_name:
+                confidence = max(confidence, 0.70)
+            evidence = [message]
+            if severity:
+                evidence.insert(0, f"severity={severity}")
+            fn_name = self._nearest_function(file_path, line, hints)
+            anchors.append(
+                DangerousFunction(
+                    id=self._id(file_path, line, check_name),
+                    file_path=file_path,
+                    line_start=line,
+                    function_name=fn_name,
+                    dangerous_api=check_name,
+                    category="tool",
+                    snippet=message[:500],
+                    language="C/C++",
+                    kind="tool_finding",
+                    rule_id=check_name,
+                    confidence=confidence,
+                    sink=check_name,
+                    evidence=evidence,
+                    tool_run_refs=[result.run_id],
+                    artifact_refs=artifact_refs,
+                    tool="clang-tidy",
                 )
             )
         return anchors
@@ -447,15 +595,23 @@ class DangerousFunctionLocator:
         ctags = shutil.which("ctags")
         if ctags:
             try:
-                proc = subprocess.run(
-                    [ctags, "-x", "--c-kinds=f", str(path)],
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
+                if ctags == "docker-exec-sandbox-ctags":
+                    sandbox_path = str(path).replace("\\", "/")
+                    for host_pfx, sbx_pfx in [("/app/", "/workspace/")]:
+                        if sandbox_path.startswith(host_pfx):
+                            sandbox_path = sbx_pfx + sandbox_path[len(host_pfx):]
+                            break
+                    proc = subprocess.run(
+                        ["docker", "exec", os.getenv("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"), "ctags", "-x", "--c-kinds=f", sandbox_path],
+                        text=True, encoding="utf-8", errors="replace",
+                        capture_output=True, timeout=10, check=False,
+                    )
+                else:
+                    proc = subprocess.run(
+                        [ctags, "-x", "--c-kinds=f", str(path)],
+                        text=True, encoding="utf-8", errors="replace",
+                        capture_output=True, timeout=10, check=False,
+                    )
             except (OSError, subprocess.TimeoutExpired):
                 proc = None
             if proc and proc.returncode == 0:
@@ -501,6 +657,114 @@ class DangerousFunctionLocator:
                 current.tool = anchor.tool
         return sorted(merged.values(), key=lambda item: item.confidence, reverse=True)
 
+    def _enrich_anchor(self, anchor: DangerousFunction) -> DangerousFunction:
+        if not anchor.anchor_category:
+            anchor.anchor_category = self._anchor_category(anchor)
+        if not anchor.rule_vuln_type:
+            anchor.rule_vuln_type = self.normalizer.normalize(
+                tool=anchor.tool,
+                rule_id=anchor.rule_id,
+                anchor_category=anchor.anchor_category,
+                category=anchor.category,
+                sink=anchor.sink or anchor.dangerous_api,
+                file_path=anchor.file_path,
+            ).value
+        if not anchor.risk_domain:
+            anchor.risk_domain = risk_domain_for(VulnType.from_string(anchor.rule_vuln_type)).value
+        if not anchor.weak_signal:
+            anchor.weak_signal = self._is_weak_signal(anchor)
+        return anchor
+
+    def _anchor_category(self, anchor: DangerousFunction) -> str:
+        path = (anchor.file_path or "").replace("\\", "/").lower()
+        if anchor.kind == "configuration_security" or ".github/" in path or "dependabot" in path:
+            return "supply_chain_config"
+        if anchor.kind == "dependency_vulnerability" or anchor.category == "dependency":
+            return "dependency"
+        if anchor.kind == "secret_leak" or anchor.category == "secret" or anchor.tool == "gitleaks":
+            return "secret"
+        if anchor.language in {"C", "C++", "C/C++", "Python", "JavaScript", "TypeScript", "Go", "Rust"}:
+            return "source_code"
+        return "weak_signal"
+
+    def _is_weak_signal(self, anchor: DangerousFunction) -> bool:
+        api = (anchor.dangerous_api or anchor.sink or "").strip()
+        if api in WEAK_CPP_APIS:
+            return True
+        if anchor.category in {"type_safety"}:
+            return True
+        if anchor.tool == "rules" and anchor.confidence < 0.50:
+            return True
+        return False
+
+    def _filter_and_rank(
+        self,
+        anchors: list[DangerousFunction],
+        budget: AuditBudget | None,
+        strategy: MiningStrategy | None = None,
+    ) -> list[DangerousFunction]:
+        suppressed = {"config": 0, "weak_signal": 0}
+        output: list[DangerousFunction] = []
+        for anchor in anchors:
+            if strategy and self._is_dismissed_by_strategy(anchor, strategy):
+                suppressed["strategy_dismissed"] = suppressed.get("strategy_dismissed", 0) + 1
+                continue
+            if budget and not budget.enable_config_audit and anchor.anchor_category == "supply_chain_config":
+                suppressed["config"] += 1
+                continue
+            if budget and anchor.weak_signal and anchor.confidence < budget.weak_signal_min_confidence:
+                suppressed["weak_signal"] += 1
+                continue
+            output.append(anchor)
+        self.last_suppressed_counts = suppressed
+
+        def rank(anchor: DangerousFunction) -> tuple[int, int, int, float]:
+            domain_weight = {
+                "source_code": 5,
+                "secret": 4,
+                "dependency": 3,
+                "supply_chain_config": 2,
+                "weak_signal": 1,
+            }.get(anchor.anchor_category or anchor.risk_domain, 0)
+            tool_weight = 2 if anchor.tool and anchor.tool != "rules" else 0
+            parser_weight = 1 if self._has_parser_context(anchor) else 0
+            strategy_weight = self._strategy_anchor_score(anchor, strategy)
+            weak_penalty = -2 if anchor.weak_signal else 0
+            return (domain_weight + weak_penalty + strategy_weight, tool_weight, parser_weight, anchor.confidence)
+
+        return sorted(output, key=rank, reverse=True)
+
+    def _is_dismissed_by_strategy(self, anchor: DangerousFunction, strategy: MiningStrategy) -> bool:
+        path = (anchor.file_path or "").replace("\\", "/").lower()
+        for item in strategy.dismissed_noise:
+            dismissed_file = str(item.get("file", "")).replace("\\", "/").lower()
+            if dismissed_file and (path == dismissed_file or path.startswith(dismissed_file.rstrip("/") + "/")):
+                return True
+        return False
+
+    def _strategy_anchor_score(self, anchor: DangerousFunction, strategy: MiningStrategy | None) -> int:
+        if not strategy:
+            return 0
+        score = 0
+        path = (anchor.file_path or "").replace("\\", "/")
+        function = anchor.function_name or ""
+        for directory in strategy.focus_directories:
+            prefix = directory.rstrip("/")
+            if prefix in {"", "."} or path.startswith(prefix + "/") or path == prefix:
+                score += 3
+                break
+        if function and any(item.lower() in function.lower() for item in strategy.priority_functions):
+            score += 8
+        if function and any(item.lower() in function.lower() for item in strategy.parser_entries):
+            score += 6
+        if function and any(item.lower() in function.lower() for item in strategy.dynamic_priority_functions):
+            score += 5
+        return score
+
+    def _has_parser_context(self, anchor: DangerousFunction) -> bool:
+        value = f"{anchor.function_name} {anchor.file_path}".lower()
+        return any(token in value for token in ("read", "decode", "parse", "load", "writemetadata", "metadata"))
+
     def _relative_tool_path(self, target: Path, value: str) -> str:
         if not value:
             return ""
@@ -527,26 +791,51 @@ class SliceAnalyzer:
 
     STATIC_KINDS = {"dependency_vulnerability", "secret_leak", "configuration_security"}
 
-    SOURCE_PATTERNS = [
-        r"request\.(args|form|json|values|GET|POST)",
-        r"req\.(query|body|params)",
-        r"\$_(GET|POST|REQUEST)",
-        r"\bargv\b|\bargc\b",
-        r"\bstdin\b|input\s*\(",
-        r"\bread\s*\(",
-        r"\bfread\s*\(",
-        r"\brecv\s*\(",
-        r"\bgetenv\s*\(",
-    ]
-    SANITIZER_PATTERNS = [
-        r"escape\s*\(",
-        r"sanitize",
-        r"validate",
-        r"realpath\s*\(",
-        r"snprintf\s*\(",
-        r"strncpy\s*\(",
-        r"parameterized",
-    ]
+    def __init__(self, rules_loader: RulesLoader | None = None) -> None:
+        self.rules_loader = rules_loader or RulesLoader()
+        self._init_patterns()
+
+    def _init_patterns(self) -> None:
+        rules = self.rules_loader.load()
+        src_rules = rules.get("cpp.sources", {})
+        guard_rules = rules.get("cpp.guards", {})
+        sanitizer_rules = rules.get("cpp.sanitizers", {})
+        parser_rules = rules.get("cpp.parser_patterns", {})
+        cpp_sources = list(src_rules.get("patterns") or []) if isinstance(src_rules, dict) else []
+        guards_list = list(guard_rules.get("patterns") or []) if isinstance(guard_rules, dict) else []
+        sanitizers_list = list(sanitizer_rules.get("patterns") or []) if isinstance(sanitizer_rules, dict) else []
+        parser_entries = list(parser_rules.get("entry_patterns") or []) if isinstance(parser_rules, dict) else []
+        self.parser_entry_patterns = parser_entries
+        # Combine built-in + rule-file patterns
+        self.SOURCE_PATTERNS = self._builtin_sources() + cpp_sources
+        self.SANITIZER_PATTERNS = self._builtin_sanitizers() + sanitizers_list
+        self.GUARD_PATTERNS = guards_list
+
+    @staticmethod
+    def _builtin_sources() -> list[str]:
+        return [
+            r"request\.(args|form|json|values|GET|POST)",
+            r"req\.(query|body|params)",
+            r"\$_(GET|POST|REQUEST)",
+            r"\bargv\b|\bargc\b",
+            r"\bstdin\b|input\s*\(",
+            r"\bread\s*\(",
+            r"\bfread\s*\(",
+            r"\brecv\s*\(",
+            r"\bgetenv\s*\(",
+        ]
+
+    @staticmethod
+    def _builtin_sanitizers() -> list[str]:
+        return [
+            r"escape\s*\(",
+            r"sanitize",
+            r"validate",
+            r"realpath\s*\(",
+            r"snprintf\s*\(",
+            r"strncpy\s*\(",
+            r"parameterized",
+        ]
 
     def analyze(
         self,
@@ -554,9 +843,13 @@ class SliceAnalyzer:
         dangerous_functions: list[DangerousFunction],
         semantic_index: SemanticIndex,
         llm_client: DeepSeekClient,
+        budget: AuditBudget | None = None,
+        strategy: MiningStrategy | None = None,
     ) -> list[ProgramSlice]:
         slices: list[ProgramSlice] = []
-        for anchor in dangerous_functions[:160]:
+        max_slices = budget.max_slices if budget else 160
+        ordered_anchors = self._order_anchors(dangerous_functions, strategy)
+        for anchor in ordered_anchors[:max_slices]:
             if anchor.kind in self.STATIC_KINDS:
                 slices.append(self._static_slice(anchor))
                 continue
@@ -569,13 +862,46 @@ class SliceAnalyzer:
             context_lines = [(idx, lines[idx - 1]) for idx in range(start, min(end, len(lines)) + 1)]
             context = "\n".join(f"{idx}: {text}" for idx, text in context_lines)
             source = self._infer_source(context)
+            # Tool-verified findings (cppcheck, clang-tidy) may not match our web/Python-centric
+            # source patterns.  Fall back to a tool-attributed source so downstream validators
+            # don't discard real C/C++ bugs just because the "source" looks unfamiliar.
+            if not source and anchor.tool_run_refs:
+                source = f"tool_verified({anchor.tool})"
             guards = [text.strip() for _, text in context_lines if re.search(r"\b(if|while|for|switch|case|assert)\b", text)]
             sanitizers = [text.strip() for _, text in context_lines if self._has_any(text, self.SANITIZER_PATTERNS)]
             definitions = [text.strip() for _, text in context_lines if re.search(r"\b\w+\s*=\s*.+", text)]
             sink_line = lines[anchor.line_start - 1] if 1 <= anchor.line_start <= len(lines) else anchor.snippet
             sink_args = self._extract_args(sink_line)
             parameters = self._infer_parameters(lines, start, end)
+
+            # --- C/C++ local data-flow enrichment (Phase D) ---
+            file_suffix = path.suffix.lower()
+            if file_suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"} and hasattr(self, "GUARD_PATTERNS"):
+                df = CppLocalDataFlowAnalyzer()
+                source_vars = [source] if source else []
+                df_result = df.analyze(lines[start - 1:end], anchor.line_start - start + 1, source_vars)
+                # Enrich guards with data-flow facts
+                for g in df_result.get("guards_before_sink", []):
+                    if g.get("has_source"):
+                        guards.append(f"[dataflow] {g['condition']} (line {g['line']})")
+                # Add size/offset/index vars as contextual evidence
+                size_vars = df_result.get("size_vars", [])
+                offset_vars = df_result.get("offset_vars", [])
+                if size_vars or offset_vars:
+                    definitions.append(f"[dataflow] size_vars={','.join(size_vars[:5])} offset_vars={','.join(offset_vars[:5])}")
+                # Better sink_args from data flow
+                df_sink_args = df_result.get("sink_args", [])
+                if df_sink_args:
+                    sink_args = list(dict.fromkeys(sink_args + df_sink_args))[:10]
+
             missing_guards = self._missing_guards(anchor, source, guards, sanitizers)
+            # Add parser-entry context for C/C++
+            if hasattr(self, "parser_entry_patterns"):
+                for pe_pat in self.parser_entry_patterns:
+                    if re.search(pe_pat, anchor.function_name or "", re.IGNORECASE):
+                        if "parser entry" not in missing_guards:
+                            missing_guards.append(f"parser_entry_matched:{pe_pat}")
+                        break
             call_chain = self._call_chain(anchor, semantic_index)
             data_flow = [item for item in [source or "unknown_input", anchor.function_name or anchor.file_path, anchor.sink] if item]
             excerpt = "\n".join(text for _, text in context_lines)
@@ -603,9 +929,41 @@ class SliceAnalyzer:
                     context=context,
                     code_excerpt=excerpt[:2000],
                     llm_summary=self._deterministic_summary(anchor, source, guards, sanitizers, missing_guards),
+                    rule_vuln_type=anchor.rule_vuln_type,
+                    anchor_kind=anchor.kind,
+                    anchor_category=anchor.anchor_category,
+                    anchor_tool=anchor.tool,
+                    anchor_confidence=anchor.confidence,
                 )
             )
         return slices
+
+    def _order_anchors(
+        self,
+        dangerous_functions: list[DangerousFunction],
+        strategy: MiningStrategy | None,
+    ) -> list[DangerousFunction]:
+        if not strategy:
+            return dangerous_functions
+
+        def score(anchor: DangerousFunction) -> tuple[int, float]:
+            value = 0
+            path = (anchor.file_path or "").replace("\\", "/")
+            function = anchor.function_name or ""
+            for directory in strategy.focus_directories:
+                prefix = directory.rstrip("/")
+                if prefix in {"", "."} or path.startswith(prefix + "/") or path == prefix:
+                    value += 3
+                    break
+            if function and any(item.lower() in function.lower() for item in strategy.priority_functions):
+                value += 8
+            if function and any(item.lower() in function.lower() for item in strategy.parser_entries):
+                value += 6
+            if function and any(item.lower() in function.lower() for item in strategy.dynamic_priority_functions):
+                value += 5
+            return (value, anchor.confidence)
+
+        return sorted(dangerous_functions, key=score, reverse=True)
 
     def _static_slice(self, anchor: DangerousFunction) -> ProgramSlice:
         context = "\n".join(anchor.evidence + [anchor.snippet])
@@ -633,6 +991,11 @@ class SliceAnalyzer:
             context=context,
             code_excerpt=context[:2000],
             llm_summary=context[:400],
+            rule_vuln_type=anchor.rule_vuln_type,
+            anchor_kind=anchor.kind,
+            anchor_category=anchor.anchor_category,
+            anchor_tool=anchor.tool,
+            anchor_confidence=anchor.confidence,
         )
 
     def _bounds_for_file(self, path: Path, lines: list[str], line_number: int) -> tuple[int, int]:
@@ -693,18 +1056,37 @@ class SliceAnalyzer:
         return None
 
     def _cpp_bounds(self, path: Path, line_number: int, lines: list[str]) -> tuple[int, int] | None:
+        # Try ctags: host first, then sandbox docker exec
         ctags = shutil.which("ctags")
-        if ctags:
+        if not ctags:
             try:
                 proc = subprocess.run(
-                    [ctags, "-x", "--c-kinds=f", str(path)],
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
+                    ["docker", "exec", os.getenv("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"), "which", "ctags"],
+                    text=True, capture_output=True, timeout=5, check=False,
                 )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    ctags = "docker-exec-sandbox-ctags"
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if ctags:
+            try:
+                if ctags == "docker-exec-sandbox-ctags":
+                    sandbox_path = str(path).replace("\\", "/")
+                    for host_pfx, sbx_pfx in [("/app/", "/workspace/")]:
+                        if sandbox_path.startswith(host_pfx):
+                            sandbox_path = sbx_pfx + sandbox_path[len(host_pfx):]
+                            break
+                    proc = subprocess.run(
+                        ["docker", "exec", os.getenv("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"), "ctags", "-x", "--c-kinds=f", sandbox_path],
+                        text=True, encoding="utf-8", errors="replace",
+                        capture_output=True, timeout=10, check=False,
+                    )
+                else:
+                    proc = subprocess.run(
+                        [ctags, "-x", "--c-kinds=f", str(path)],
+                        text=True, encoding="utf-8", errors="replace",
+                        capture_output=True, timeout=10, check=False,
+                    )
             except (OSError, subprocess.TimeoutExpired):
                 proc = None
             if proc and proc.returncode == 0:
@@ -794,30 +1176,182 @@ class SliceAnalyzer:
         return hashlib.sha1(f"{anchor_id}:{context[:240]}".encode("utf-8")).hexdigest()[:12]
 
 
-class CandidateGenerator:
-    def __init__(self, cwe_mapping: dict[str, str] | None = None) -> None:
-        self.cwe_mapping = cwe_mapping or dict(RulesLoader().load().get("common.cwe_mapping") or {})
+# ---------------------------------------------------------------------------
+# C/C++ function-local data-flow analyser (Phase D)
+# ---------------------------------------------------------------------------
 
-    def generate(self, slices: list[ProgramSlice], llm_client: DeepSeekClient) -> list[VulnerabilityCandidate]:
+class CppLocalDataFlowAnalyzer:
+    """Lightweight, function-local data-flow analysis for C/C++.
+
+    Does NOT perform inter-procedural or whole-program analysis.
+    Identifies size/offset/index variables, guard expressions, and
+    whether a guard dominates a given sink line.
+    """
+
+    def analyze(self, lines: list[str], sink_line: int, source_vars: list[str]) -> dict[str, Any]:
+        """Analyse *lines* and return structured data-flow facts."""
+        result: dict[str, Any] = {
+            "definitions": [],
+            "assignments": [],
+            "size_vars": [],
+            "offset_vars": [],
+            "index_vars": [],
+            "guard_expressions": [],
+            "guards_before_sink": [],
+            "sink_args": [],
+            "aliases": [],
+        }
+
+        # Collect definitions / assignments / guards / sink args
+        for idx, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("//", "/*", "*", "#")):
+                continue
+            # Variable definitions (simplified: type identifier = ...)
+            def_match = re.match(
+                r"(?:const\s+)?(?:unsigned\s+)?(?:size_t|int|long|uint\w*|auto)\s+(\w+)\s*[=;]",
+                stripped,
+            )
+            if def_match:
+                var = def_match.group(1)
+                result["definitions"].append({"var": var, "line": idx})
+                if any(kw in var.lower() for kw in ("size", "len", "length", "count", "num", "total", "max", "capacity")):
+                    result["size_vars"].append(var)
+                if any(kw in var.lower() for kw in ("offset", "pos", "start", "begin", "seek")):
+                    result["offset_vars"].append(var)
+                if any(kw in var.lower() for kw in ("idx", "index", "i", "j", "k")):
+                    result["index_vars"].append(var)
+
+            # Variable assignment (simplified: identifier = expression)
+            assign_match = re.match(r"(\w+)\s*=\s*(.+);", stripped)
+            if assign_match:
+                var, expr = assign_match.group(1), assign_match.group(2)
+                result["assignments"].append({"var": var, "expr": expr, "line": idx})
+                # Detect aliases / pointer references
+                if "&" in expr or var.startswith("p") or "Ptr" in var:
+                    result["aliases"].append({"var": var, "expr": expr, "line": idx})
+
+            # Guard expressions (if/while/for conditions before sink)
+            guard_match = re.match(r"(?:if|while|for)\s*\((.+)\)", stripped)
+            if guard_match and idx < sink_line:
+                condition = guard_match.group(1)
+                result["guard_expressions"].append({"condition": condition, "line": idx})
+                contains_source = any(sv in condition for sv in source_vars)
+                if contains_source:
+                    result["guards_before_sink"].append({"condition": condition, "line": idx, "has_source": True})
+
+            # Sink arguments (extract args from the sink line)
+            if idx == sink_line:
+                args_match = re.search(r"\((.*)\)", stripped)
+                if args_match:
+                    args = [a.strip() for a in args_match.group(1).split(",") if a.strip()]
+                    result["sink_args"] = args
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# CandidateGenerator
+# ---------------------------------------------------------------------------
+
+class CandidateGenerator:
+    def __init__(
+        self,
+        cwe_mapping: dict[str, str] | None = None,
+        normalizer: VulnerabilityTypeNormalizer | None = None,
+        llm_client: DeepSeekClient | None = None,
+    ) -> None:
+        self.cwe_mapping = cwe_mapping or dict(RulesLoader().load().get("common.cwe_mapping") or {})
+        self.normalizer = normalizer or VulnerabilityTypeNormalizer()
+        self.reviewer = LLMCandidateReviewer(llm_client) if llm_client else None
+        self.llm_calls_used = 0
+
+    def generate(
+        self,
+        slices: list[ProgramSlice],
+        llm_client: DeepSeekClient,
+        budget: AuditBudget | None = None,
+    ) -> list[VulnerabilityCandidate]:
+        """Generate candidates from slices, using different strategies for tool vs rules anchors.
+
+        - **Tool-anchor slices** (semgrep, cppcheck, clang-tidy): full LLM generation
+          because the tool output is richer and LLM can interpret it contextually.
+        - **Rules-anchor slices** (regex-matched memcpy, strcpy, etc.): fast deterministic
+          path using _fallback_candidate().  The sink is already known and the normalizer
+          maps it to a VulnType.  No LLM call needed per slice.
+        """
         candidates: list[VulnerabilityCandidate] = []
-        grouped: dict[tuple[str, str], list[ProgramSlice]] = {}
-        for program_slice in slices[:120]:
-            inferred = self._type_from_sink(program_slice.sink)
-            grouped.setdefault((self._language(program_slice.file_path), inferred), []).append(program_slice)
-        for (_language, _vuln_type), group in grouped.items():
-            batch_size = max(3, min(4, 8))
-            for index in range(0, len(group), batch_size):
-                batch = group[index : index + batch_size]
-                llm_candidates = self._ask_llm_batch(batch, llm_client)
-                for slice_index, program_slice in enumerate(batch):
-                    raw = llm_candidates[slice_index] if slice_index < len(llm_candidates) else None
+        tool_slices: list[ProgramSlice] = []
+        rule_slices: list[ProgramSlice] = []
+        self.llm_calls_used = 0
+        max_candidates = budget.max_candidates if budget else 200
+        max_llm_calls = budget.max_llm_calls if budget else 999_999
+
+        for program_slice in slices[:max_candidates]:
+            # Slices with tool evidence → LLM path; pure rule matches → fast path
+            if program_slice.anchor_tool == "rules" and not program_slice.tool_run_refs:
+                rule_slices.append(program_slice)
+            else:
+                tool_slices.append(program_slice)
+
+        # --- Fast path: rules-based slices (no LLM per slice) ---
+        for program_slice in rule_slices:
+            candidates.append(self._fallback_candidate(program_slice))
+
+        # --- LLM path: tool-based slices (batch generation + parallel) ---
+        if tool_slices:
+            grouped: dict[tuple[str, str], list[ProgramSlice]] = {}
+            for program_slice in tool_slices:
+                inferred = self._type_from_sink(program_slice.sink)
+                grouped.setdefault((self._language(program_slice.file_path), inferred), []).append(program_slice)
+
+            # Build all batches
+            batches: list[list[ProgramSlice]] = []
+            for (_lang, _vt), group in grouped.items():
+                batch_size = max(3, min(4, 8))
+                for i in range(0, len(group), batch_size):
+                    batches.append(group[i : i + batch_size])
+            if len(batches) > max_llm_calls:
+                batches = batches[:max_llm_calls]
+
+            # Parallelize LLM batch calls (I/O-bound — ThreadPoolExecutor)
+            batch_results: list[tuple[int, list[dict[str, Any]]]] = []
+            if len(batches) > 1 and llm_client.enabled:
+                with ThreadPoolExecutor(max_workers=min(4, len(batches))) as ex:
+                    future_to_idx = {
+                        ex.submit(self._ask_llm_batch, batch, llm_client): i
+                        for i, batch in enumerate(batches)
+                    }
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        try:
+                            batch_results.append((idx, future.result()))
+                        except Exception:
+                            batch_results.append((idx, []))
+                # Sort back to original order
+                batch_results.sort(key=lambda x: x[0])
+            else:
+                for i, batch in enumerate(batches):
+                    batch_results.append((i, self._ask_llm_batch(batch, llm_client)))
+
+            for batch_idx, (batch, llm_result) in enumerate(zip(batches, [r[1] for r in batch_results])):
+                for slice_idx, program_slice in enumerate(batch):
+                    raw = llm_result[slice_idx] if slice_idx < len(llm_result) else None
                     candidate = self._candidate_from_raw(program_slice, raw) if raw else self._fallback_candidate(program_slice)
                     candidates.append(candidate)
-        return candidates
+
+        # LLM quality gate — review suspicious candidates (tool-based + low-confidence rule-based)
+        if self.reviewer and self.llm_calls_used < max_llm_calls:
+            self.reviewer.max_llm_calls = max_llm_calls - self.llm_calls_used
+            candidates = self.reviewer.review_batch(candidates, llm_client)
+            self.llm_calls_used += self.reviewer.llm_calls_used
+
+        return candidates[:max_candidates]
 
     def _ask_llm_batch(self, slices: list[ProgramSlice], llm_client: DeepSeekClient) -> list[dict[str, Any]]:
         if not hasattr(llm_client, "chat"):
             return []
+        self.llm_calls_used += 1
         prompt = (
             "Return a JSON array of vulnerability candidates. Each item must map to the corresponding slice index and "
             "include file, function, line, sink, trigger_condition, title, vulnerability_type, severity, description, "
@@ -841,11 +1375,29 @@ class CandidateGenerator:
         return raw if isinstance(raw, list) else []
 
     def _candidate_from_raw(self, program_slice: ProgramSlice, raw: dict[str, Any]) -> VulnerabilityCandidate:
-        vuln_type = str(raw.get("vulnerability_type") or self._type_from_sink(program_slice.sink))
-        trigger_conditions = [str(item) for item in raw.get("trigger_conditions") or raw.get("trigger_condition") or []]
-        if isinstance(raw.get("trigger_condition"), str):
-            trigger_conditions = [str(raw["trigger_condition"])]
-        valid, validity = self._validate_candidate(program_slice, trigger_conditions)
+        # Normalize C++ std:: prefixes before type normalization
+        raw_sink = str(program_slice.sink or "")
+        normalized_sink = self._normalize_sink(raw_sink)
+        if normalized_sink != raw_sink:
+            program_slice.sink = normalized_sink
+
+        vuln_type = self.normalizer.normalize(
+            llm_type=str(raw.get("vulnerability_type") or ""),
+            rule_vuln_type=program_slice.rule_vuln_type,
+            anchor_category=program_slice.anchor_category,
+            sink=program_slice.sink,
+            file_path=program_slice.file_path,
+            category=program_slice.anchor_category,
+        ).value
+        trigger_conditions = coerce_str_list(raw.get("trigger_conditions") or raw.get("trigger_condition"))[:8]
+
+        # Detect LLM self-identified false positives from the title
+        title = str(raw.get("title") or "")
+        if re.search(r"^\s*false\s*positive", title, re.IGNORECASE):
+            return self._fallback_candidate(program_slice, reject_reason=f"LLM self-identified false positive: {title[:120]}")
+
+        valid, validity, invalid_reason = self._validate_candidate(program_slice, trigger_conditions)
+        risk_domain = risk_domain_for(VulnType.from_string(vuln_type)).value
         return VulnerabilityCandidate(
             id=self._id(program_slice.id, str(raw.get("title") or vuln_type)),
             slice_id=program_slice.id,
@@ -857,23 +1409,58 @@ class CandidateGenerator:
             description=str(raw.get("description") or ""),
             function_name=program_slice.function_name,
             trigger_conditions=trigger_conditions[:8],
-            evidence=[str(item) for item in raw.get("evidence", [])][:12],
+            evidence=coerce_str_list(raw.get("evidence"))[:12],
             cwe=self.cwe_mapping.get(vuln_type, ""),
             sink=program_slice.sink,
             source=program_slice.source,
-            missing_checks=[str(item) for item in raw.get("missing_checks", [])][:8],
-            assumptions=[str(item) for item in raw.get("assumptions", [])][:8],
+            missing_checks=coerce_str_list(raw.get("missing_checks"))[:8],
+            assumptions=coerce_str_list(raw.get("assumptions"))[:8],
             evidence_refs=[program_slice.id, *program_slice.tool_run_refs, *program_slice.artifact_refs],
             confidence=self._parse_confidence(raw.get("confidence")),
             valid=valid,
             validity=validity,
             llm_reasoning=str(raw.get("llm_reasoning") or ""),
+            candidate_source="llm",
+            invalid_reason=invalid_reason,
+            risk_domain=risk_domain,
         )
 
-    def _fallback_candidate(self, program_slice: ProgramSlice) -> VulnerabilityCandidate:
-        vuln_type = self._type_from_sink(program_slice.sink)
+    @staticmethod
+    def _normalize_sink(sink: str) -> str:
+        """Normalize C++ std:: prefix variants to canonical sink names.
+
+        std::memcpy → memcpy, std::strcpy → strcpy, etc.
+        This prevents duplicate findings for the same vulnerability.
+        """
+        if not sink:
+            return sink
+        # Strip std:: prefix
+        normalized = re.sub(r'^std::', '', sink.strip())
+        # Also normalize common C++ variants
+        normalized = normalized.strip()
+        return normalized
+
+    def _fallback_candidate(
+        self, program_slice: ProgramSlice, reject_reason: str = ""
+    ) -> VulnerabilityCandidate:
+        # Normalize C++ std:: prefix to prevent duplicate findings
+        raw_sink = str(program_slice.sink or "")
+        normalized_sink = self._normalize_sink(raw_sink)
+        if normalized_sink != raw_sink:
+            program_slice.sink = normalized_sink
+        vuln_type = self.normalizer.normalize(
+            rule_vuln_type=program_slice.rule_vuln_type,
+            anchor_category=program_slice.anchor_category,
+            sink=program_slice.sink,
+            file_path=program_slice.file_path,
+            category=program_slice.anchor_category,
+        ).value
         trigger_conditions = [program_slice.source] if program_slice.source else []
-        valid, validity = self._validate_candidate(program_slice, trigger_conditions)
+        if reject_reason:
+            valid, validity, invalid_reason = False, "invalid_candidate", reject_reason
+        else:
+            valid, validity, invalid_reason = self._validate_candidate(program_slice, trigger_conditions)
+        risk_domain = risk_domain_for(VulnType.from_string(vuln_type)).value
         return VulnerabilityCandidate(
             id=self._id(program_slice.id, vuln_type),
             slice_id=program_slice.id,
@@ -890,27 +1477,68 @@ class CandidateGenerator:
             sink=program_slice.sink,
             source=program_slice.source,
             missing_checks=list(program_slice.missing_guards),
-            assumptions=["fallback_candidate"],
+            assumptions=["fallback_candidate"] if not reject_reason else [reject_reason],
             evidence_refs=[program_slice.id, *program_slice.tool_run_refs, *program_slice.artifact_refs],
             confidence=0.48,
             valid=valid,
             validity=validity,
             llm_reasoning=program_slice.llm_summary,
+            candidate_source="rule",
+            invalid_reason=invalid_reason,
+            risk_domain=risk_domain,
         )
 
-    def _validate_candidate(self, program_slice: ProgramSlice, trigger_conditions: list[str]) -> tuple[bool, str]:
+    def _validate_candidate(self, program_slice: ProgramSlice, trigger_conditions: list[str]) -> tuple[bool, str, str]:
+        """Return (valid, validity, invalid_reason)."""
         static_sources = {"dependency manifest", "source literal", "configuration file", "static evidence"}
-        has_required_context = bool(program_slice.function_name) or program_slice.source in static_sources
-        required = all(
-            [
-                bool(program_slice.file_path),
-                bool(program_slice.line_start),
-                bool(program_slice.sink),
-                has_required_context,
-                bool(trigger_conditions),
-            ]
+        # Tool findings (cppcheck, clang-tidy, etc.) carry their own evidence via tool_run_refs.
+        # They don't need a human-readable function_name or source to be valid — the tool
+        # already verified the file, line, and check.  This prevents real C/C++ bugs from
+        # being discarded just because we can't infer a "source" from regex patterns.
+        has_tool_evidence = bool(program_slice.tool_run_refs)
+        has_required_context = (
+            bool(program_slice.function_name)
+            or program_slice.source in static_sources
+            or has_tool_evidence
         )
-        return (required, "valid" if required else "invalid_candidate")
+        reasons: list[str] = []
+        if not program_slice.file_path:
+            reasons.append("missing_file_path")
+        if not program_slice.line_start:
+            reasons.append("missing_line_start")
+        if not program_slice.sink:
+            reasons.append("missing_sink")
+        if not has_required_context:
+            if not program_slice.function_name:
+                reasons.append("missing_function_name")
+            if program_slice.source not in static_sources and not has_tool_evidence:
+                reasons.append("missing_source_or_static_context")
+        if not trigger_conditions:
+            reasons.append("missing_trigger_condition")
+        if self._is_unsupported_weak_cpp_candidate(program_slice):
+            reasons.append("weak_cpp_rule_without_strong_condition")
+        if not reasons:
+            return (True, "valid", "")
+        return (False, "invalid_candidate", ";".join(reasons))
+
+    def _is_unsupported_weak_cpp_candidate(self, program_slice: ProgramSlice) -> bool:
+        if program_slice.anchor_tool != "rules":
+            return False
+        if program_slice.anchor_category not in {"", "source_code"}:
+            return False
+        sink = (program_slice.sink or "").strip()
+        if sink not in WEAK_CPP_APIS and program_slice.anchor_confidence >= 0.50:
+            return False
+        has_tool_evidence = bool(program_slice.tool_run_refs)
+        has_source_sink_guard = bool(program_slice.source and program_slice.sink and program_slice.missing_guards)
+        context = f"{program_slice.function_name} {program_slice.file_path}".lower()
+        has_parser_context = any(token in context for token in ("read", "decode", "parse", "load", "writemetadata", "metadata"))
+        has_combo_rule = (
+            sink in {"memcpy", "memmove", "std::copy", "copy"}
+            and bool(program_slice.sink_args)
+            and any("bound" in item.lower() or "length" in item.lower() for item in program_slice.missing_guards)
+        )
+        return not (has_tool_evidence or has_source_sink_guard or has_parser_context or has_combo_rule)
 
     def _parse_confidence(self, value: Any) -> float:
         if value is None or value == "":
@@ -949,36 +1577,21 @@ class CandidateGenerator:
         return f"{program_slice.function_name or program_slice.file_path} may expose {vuln_type}"
 
     def _type_from_sink(self, sink: str) -> str:
-        value = sink.lower()
-        if "strcpy" in value or "strcat" in value or "sprintf" in value or "gets" in value:
-            return "unsafe_c_string_api"
-        if "memcpy" in value:
-            return "unsafe_memory_copy"
-        if "system" in value or "popen" in value or "subprocess" in value or "child_process" in value:
-            return "command_injection"
-        if "execute" in value or "sql" in value:
-            return "sql_injection"
-        if "open" in value or "send_file" in value:
-            return "path_traversal"
-        if "eval" in value:
-            return "code_execution"
-        if "pickle" in value or "yaml.load" in value:
-            return "deserialization"
-        if "cve" in value or "ghsa" in value or "rustsec" in value or "pysec" in value:
-            return "dependency_vulnerability"
-        if "gitleaks" in value or "secret" in value:
-            return "secret_leak"
-        if any(token in value for token in ("github-actions", "dependabot", "mutable-action", "workflow", "supply-chain")):
-            return "supply_chain_config"
-        return "other"
+        vuln_type = self.normalizer.normalize(sink=sink)
+        return vuln_type.value
 
     def _severity_for(self, vuln_type: str) -> str:
-        if vuln_type in {"command_injection", "code_execution", "unsafe_c_string_api", "unsafe_memory_copy"}:
+        if vuln_type in {"command_injection", "code_execution", "unsafe_c_string_api",
+                         "unsafe_memory_copy", "out_of_bounds_write", "use_after_free",
+                         "double_free"}:
             return "high"
-        if vuln_type in {"sql_injection", "deserialization"}:
+        if vuln_type in {"sql_injection", "deserialization", "integer_overflow",
+                         "out_of_bounds_read", "null_dereference", "path_traversal"}:
             return "medium"
         if vuln_type == "supply_chain_config":
             return "medium"
+        if vuln_type in {"resource_leak", "weak_static_proof"}:
+            return "low"
         return "low"
 
     def _language(self, file_path: str) -> str:
@@ -1001,19 +1614,152 @@ class CandidateGenerator:
         return hashlib.sha1(f"{slice_id}:{title}".encode("utf-8")).hexdigest()[:12]
 
 
+class LLMCandidateReviewer:
+    """LLM-powered quality gate for vulnerability candidates.
+
+    Reviews candidates in batches, asking the LLM to distinguish real security
+    vulnerabilities from config-lint / best-practice / tool-noise findings.
+    Rejected candidates get valid=False so ClueAggregator drops them.
+    """
+
+    REVIEW_PROMPT = """你是资深安全审计专家。请审查以下漏洞候选，判断它是否是一个**真实的安全漏洞**。
+
+审查要点:
+1. 这个 sink 在该上下文中是否真的危险（能导致可利用的安全后果）？
+2. 这是**代码漏洞**还是**配置规范建议**？
+3. 如果候选的文件是 CI 配置（YAML JSON TOML），且 sink 是 lint 规则匹配，这是配置检查而非漏洞
+4. 如果是 dependency/package 相关的发现，检查是否有已知 CVE 或具体风险描述
+
+对每个候选输出 JSON 数组:
+[{"verdict": "confirmed|rejected", "reasoning": "简短理由"}]
+
+- confirmed: 这是一个需要关注的安全漏洞
+- rejected: 这是配置lint、代码风格、或不构成实际安全威胁的发现"""
+
+    def __init__(self, llm_client: DeepSeekClient | None = None):
+        self.llm_client = llm_client
+        self.max_llm_calls = 999_999
+        self.llm_calls_used = 0
+
+    def review_batch(
+        self,
+        candidates: list[VulnerabilityCandidate],
+        llm_client: DeepSeekClient,
+    ) -> list[VulnerabilityCandidate]:
+        """Review a list of candidates. Returns the same list with invalid ones flagged."""
+        if not self.llm_client:
+            self.llm_client = llm_client
+
+        to_review = [c for c in candidates if self._needs_review(c)]
+        if not to_review:
+            return candidates
+
+        # Review in small batches (max 3 per call)
+        self.llm_calls_used = 0
+        for batch_start in range(0, len(to_review), 3):
+            if self.llm_calls_used >= self.max_llm_calls:
+                break
+            batch = to_review[batch_start : batch_start + 3]
+            judgments = self._ask_llm(batch)
+            for candidate, judgment in zip(batch, judgments):
+                verdict = str(judgment.get("verdict", "")).lower()
+                reasoning = str(judgment.get("reasoning", ""))
+                if verdict == "rejected":
+                    candidate.mark_invalid(f"llm_rejected({reasoning[:120]})" if reasoning else "llm_rejected")
+                elif verdict == "confirmed":
+                    # Boost confidence for LLM-confirmed candidates
+                    candidate.confidence = min(0.95, candidate.confidence + 0.08)
+
+        return candidates
+
+    def _needs_review(self, candidate: VulnerabilityCandidate) -> bool:
+        """Only review the most suspicious candidates to minimize LLM calls."""
+        if not candidate.valid:
+            return False
+        vt = (candidate.vulnerability_type or "").lower()
+        # Only review supply_chain_config that have vague titles (likely config lint noise)
+        if vt == "supply_chain_config":
+            title = (candidate.title or "").lower()
+            noise_keywords = ["github-actions", "mutable", "dependabot", "workflow", "other"]
+            return any(kw in title for kw in noise_keywords)
+        # Only review dependency findings with no CVE reference
+        if vt == "dependency_vulnerability":
+            return not any("cve" in str(e).lower() for e in candidate.evidence)
+        return False
+
+    def _ask_llm(self, candidates: list[VulnerabilityCandidate]) -> list[dict[str, Any]]:
+        """Ask LLM to review a batch of candidates."""
+        self.llm_calls_used += 1
+        items = []
+        for i, c in enumerate(candidates):
+            items.append({
+                "index": i,
+                "title": c.title,
+                "type": c.vulnerability_type,
+                "file": c.file_path,
+                "line": c.line_start,
+                "sink": c.sink,
+                "source": c.source,
+                "function": c.function_name,
+                "description": (c.description or "")[:300],
+                "evidence": [str(e)[:200] for e in (c.evidence or [])[:3]],
+            })
+
+        prompt = self.REVIEW_PROMPT + "\n\n候选列表:\n" + json.dumps(items, ensure_ascii=False, indent=2)
+        try:
+            resp = self.llm_client.chat(
+                "你是安全审计专家。只输出JSON数组，不要其他内容。",
+                prompt,
+                timeout=45,
+            )
+        except Exception:
+            return [{"verdict": "confirmed", "reasoning": "LLM unavailable"}] * len(candidates)
+
+        if not resp.ok or not resp.content.strip():
+            return [{"verdict": "confirmed", "reasoning": "LLM error"}] * len(candidates)
+
+        # Parse JSON array
+        text = resp.content.strip()
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\[.*\]", text, re.S)
+            if match:
+                try:
+                    result = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    return [{"verdict": "confirmed", "reasoning": "parse error"}] * len(candidates)
+            else:
+                return [{"verdict": "confirmed", "reasoning": "parse error"}] * len(candidates)
+
+        if isinstance(result, list) and len(result) == len(candidates):
+            return result
+        # Mismatch — accept all
+        return [{"verdict": "confirmed", "reasoning": "result mismatch"}] * len(candidates)
+
+
 class ClueAggregator:
     def aggregate(self, candidates: list[VulnerabilityCandidate]) -> list[VulnerabilityCandidate]:
-        merged: dict[tuple[str, str, str, str], VulnerabilityCandidate] = {}
-        trigger_counts: dict[tuple[str, str, str, str], int] = {}
+        merged: dict[tuple, VulnerabilityCandidate] = {}
+        trigger_counts: dict[tuple, int] = {}
         for candidate in candidates:
             if not candidate.valid or candidate.validity != "valid":
                 continue
-            key = (
-                candidate.file_path,
-                candidate.function_name or "",
-                candidate.sink or candidate.vulnerability_type,
-                candidate.source or "",
-            )
+            # Aggregate key varies by risk domain
+            vt = (candidate.vulnerability_type or "").lower()
+            if vt in ("supply_chain_config",):
+                key = (candidate.file_path, candidate.vulnerability_type, str(candidate.line_start), "")
+            elif vt in ("dependency_vulnerability",):
+                key = (candidate.function_name or candidate.file_path, candidate.vulnerability_type, candidate.sink or "", "")
+            elif vt in ("secret_leak",):
+                key = (candidate.file_path, candidate.sink or candidate.vulnerability_type, "", "")
+            else:
+                key = (
+                    candidate.file_path,
+                    candidate.function_name or "",
+                    candidate.sink or candidate.vulnerability_type,
+                    candidate.source or "",
+                )
             trigger_counts[key] = trigger_counts.get(key, 0) + 1
             current = merged.get(key)
             if current is None:
@@ -1036,9 +1782,12 @@ class ClueAggregator:
         return sorted(merged.values(), key=lambda item: item.confidence, reverse=True)
 
     def _evidence_strength(self, candidate: VulnerabilityCandidate) -> str:
-        if candidate.confidence >= 0.75 or len(candidate.evidence) >= 4:
+        # Source weighting: tool > rule > llm
+        source_bonus = {"tool": 0.08, "rule": 0.04, "llm": 0.0}.get(candidate.candidate_source, 0.0)
+        adjusted = candidate.confidence + source_bonus
+        if adjusted >= 0.75 or len(candidate.evidence) >= 4:
             return "strong"
-        if candidate.confidence >= 0.55 or len(candidate.evidence) >= 2:
+        if adjusted >= 0.55 or len(candidate.evidence) >= 2:
             return "medium"
         return "weak"
 
@@ -1050,32 +1799,68 @@ class VulnerabilityClassifier:
         "path_traversal": ("CWE-22", "A01:2021-Broken Access Control"),
         "unsafe_memory_copy": ("CWE-787", "Memory Safety"),
         "unsafe_c_string_api": ("CWE-120", "Memory Safety"),
+        "integer_overflow": ("CWE-190", "Memory Safety"),
+        "out_of_bounds_read": ("CWE-125", "Memory Safety"),
+        "out_of_bounds_write": ("CWE-787", "Memory Safety"),
+        "use_after_free": ("CWE-416", "Memory Safety"),
+        "double_free": ("CWE-415", "Memory Safety"),
+        "null_dereference": ("CWE-476", "Memory Safety"),
+        "resource_leak": ("CWE-404", "Memory Safety"),
         "code_execution": ("CWE-94", "A03:2021-Injection"),
         "deserialization": ("CWE-502", "A08:2021-Software and Data Integrity Failures"),
         "dependency_vulnerability": ("CWE-1104", "Vulnerable and Outdated Components"),
         "secret_leak": ("CWE-798", "A07:2021-Identification and Authentication Failures"),
         "supply_chain_config": ("CWE-829", "A08:2021-Software and Data Integrity Failures"),
+        "weak_static_proof": ("", ""),
+        "other": ("", ""),
     }
+
+    def __init__(
+        self,
+        normalizer: VulnerabilityTypeNormalizer | None = None,
+        llm_client: DeepSeekClient | None = None,
+    ) -> None:
+        self.normalizer = normalizer or VulnerabilityTypeNormalizer()
+        self.llm_client = llm_client
 
     def classify(
         self,
         candidates: list[VulnerabilityCandidate],
         slices: list[ProgramSlice],
         llm_client: DeepSeekClient,
+        budget: AuditBudget | None = None,
     ) -> list[Finding]:
         slices_by_id = {item.id: item for item in slices}
         findings: list[Finding] = []
-        for candidate in candidates[:80]:
+        max_findings = budget.max_findings if budget else 80
+        for candidate in candidates[:max_findings]:
             program_slice = slices_by_id.get(candidate.slice_id)
             if not program_slice:
                 continue
-            vuln_type = candidate.vulnerability_type
+            # Normalize type through the normalizer (never use raw LLM string)
+            vuln_type = self.normalizer.normalize(
+                llm_type=candidate.vulnerability_type,
+                rule_vuln_type=program_slice.rule_vuln_type,
+                anchor_category=program_slice.anchor_category or candidate.risk_domain,
+                sink=program_slice.sink,
+                file_path=candidate.file_path,
+                category=program_slice.anchor_category or candidate.risk_domain,
+            ).value
+            vuln_type_enum = VulnType.from_string(vuln_type)
+            risk_domain = risk_domain_for(vuln_type_enum).value
             cwe, owasp = self.TAXONOMY.get(vuln_type, ("", ""))
-            score_breakdown = self._score(vuln_type, candidate, program_slice)
+            score_breakdown = self._score(vuln_type, risk_domain, candidate, program_slice)
             total_score = sum(score_breakdown.values())
             severity = self._severity(total_score)
+            # LLM-assisted severity review for source_code findings
+            if self.llm_client and risk_domain == "source_code":
+                llm_adj = self._llm_severity_assessment(candidate, program_slice, vuln_type)
+                if llm_adj:
+                    severity = llm_adj.get("severity", severity)
+                    if llm_adj.get("reasoning"):
+                        score_breakdown["llm_review"] = llm_adj["reasoning"][:100]
             evidence_strength = self._evidence_strength(total_score)
-            should_verify = self._should_verify(vuln_type, evidence_strength, total_score)
+            should_verify = self._should_verify(vuln_type_enum, evidence_strength, total_score)
             summary = self._summary(candidate, program_slice, total_score, score_breakdown)
             graph = self._chain_graph(candidate, program_slice, vuln_type)
             findings.append(
@@ -1091,7 +1876,14 @@ class VulnerabilityClassifier:
                     source=program_slice.source,
                     sink=program_slice.sink,
                     call_chain=program_slice.call_chain,
-                    evidence=[*candidate.evidence, summary, f"score={total_score}", *[f"{k}={v}" for k, v in score_breakdown.items()]],
+                    evidence=[
+                        *candidate.evidence,
+                        summary,
+                        f"score={total_score}",
+                        f"director_priority={candidate.director_priority}",
+                        f"director_reason={candidate.director_reason or 'n/a'}",
+                        *[f"{k}={v}" for k, v in score_breakdown.items()],
+                    ],
                     confidence=min(0.95, max(0.1, candidate.confidence + total_score / 20)),
                     needs_verification=should_verify,
                     evidence_strength=evidence_strength,
@@ -1114,22 +1906,56 @@ class VulnerabilityClassifier:
                     artifact_refs=list(program_slice.artifact_refs),
                     chain_graph=graph,
                     chinese_summary=summary,
+                    risk_domain=risk_domain,
+                    director_priority=candidate.director_priority,
+                    director_reason=candidate.director_reason,
+                    verification_hint=dict(candidate.verification_hint),
                 )
             )
         return findings
 
-    def _score(self, vuln_type: str, candidate: VulnerabilityCandidate, program_slice: ProgramSlice) -> dict[str, int]:
+    def _score(
+        self,
+        vuln_type: str,
+        risk_domain: str,
+        candidate: VulnerabilityCandidate,
+        program_slice: ProgramSlice,
+    ) -> dict[str, int]:
+        """Compute a score breakdown appropriate to the risk domain."""
+        if risk_domain == "supply_chain_config":
+            return self._score_config(candidate)
+        if risk_domain in ("dependency",):
+            return self._score_dependency(candidate)
+        if risk_domain in ("secret",):
+            return self._score_secret(candidate)
+        return self._score_source_code(vuln_type, candidate, program_slice)
+
+    def _score_source_code(
+        self,
+        vuln_type: str,
+        candidate: VulnerabilityCandidate,
+        program_slice: ProgramSlice,
+    ) -> dict[str, int]:
         sink_danger = {
             "command_injection": 3,
             "code_execution": 3,
             "unsafe_c_string_api": 3,
             "unsafe_memory_copy": 3,
+            "out_of_bounds_write": 3,
+            "use_after_free": 3,
+            "double_free": 3,
             "sql_injection": 2,
             "path_traversal": 2,
             "deserialization": 2,
+            "integer_overflow": 2,
+            "out_of_bounds_read": 2,
+            "null_dereference": 2,
+            "resource_leak": 1,
             "dependency_vulnerability": 1,
             "secret_leak": 1,
             "supply_chain_config": 1,
+            "weak_static_proof": 0,
+            "other": 0,
         }.get(vuln_type, 1)
         source_control = 0
         if program_slice.source in {"dependency manifest", "source literal", "configuration file", "static evidence"}:
@@ -1147,6 +1973,117 @@ class VulnerabilityClassifier:
             "tool_corroboration": tool_corroboration,
         }
 
+    def _score_config(self, candidate: VulnerabilityCandidate) -> dict[str, int]:
+        """Scoring formula for supply_chain_config / CI-CD findings."""
+        tool_corroboration = min(2, len(candidate.evidence_refs))
+        rule_confidence = int(min(3, candidate.confidence * 4))
+        asset_importance = 0
+        fp = (candidate.file_path or "").lower()
+        if ".github/workflows" in fp:
+            asset_importance = 2
+        elif "dependabot" in fp:
+            asset_importance = 1
+        exploit_precondition = 0
+        if any("mutable" in e.lower() or "unpinned" in e.lower() for e in candidate.evidence):
+            exploit_precondition = 2
+        elif any("action" in e.lower() for e in candidate.evidence):
+            exploit_precondition = 1
+        return {
+            "rule_confidence": rule_confidence,
+            "asset_importance": asset_importance,
+            "exploit_precondition": exploit_precondition,
+            "tool_corroboration": tool_corroboration,
+        }
+
+    def _score_dependency(self, candidate: VulnerabilityCandidate) -> dict[str, int]:
+        """Scoring formula for dependency_vulnerability findings."""
+        tool_corroboration = min(2, len(candidate.evidence_refs))
+        rule_confidence = int(min(3, candidate.confidence * 4))
+        # Higher severity CVEs get higher importance
+        sev = (candidate.severity or "").lower()
+        asset_importance = {"critical": 2, "high": 2, "medium": 1, "low": 0}.get(sev, 1)
+        return {
+            "rule_confidence": rule_confidence,
+            "asset_importance": asset_importance,
+            "tool_corroboration": tool_corroboration,
+        }
+
+    def _score_secret(self, candidate: VulnerabilityCandidate) -> dict[str, int]:
+        """Scoring formula for secret_leak findings."""
+        tool_corroboration = min(2, len(candidate.evidence_refs))
+        rule_confidence = int(min(3, candidate.confidence * 4))
+        return {
+            "rule_confidence": rule_confidence,
+            "tool_corroboration": tool_corroboration,
+        }
+
+    def _llm_severity_assessment(
+        self,
+        candidate: VulnerabilityCandidate,
+        program_slice: ProgramSlice,
+        vuln_type: str,
+    ) -> dict[str, str] | None:
+        """Ask LLM to assess the true severity of a source_code finding.
+
+        Hardcoded scoring tables can't distinguish "memcpy in an unreachable debug
+        function" from "memcpy on attacker-controlled input in a parser entry."
+        The LLM reads the actual context and provides a calibrated assessment.
+        """
+        if not self.llm_client:
+            return None
+
+        context_lines = (program_slice.code_excerpt or program_slice.context or "")[:1500]
+        prompt = f"""你是安全审计专家。请评估以下漏洞的严重度。
+
+漏洞类型: {vuln_type}
+文件: {candidate.file_path}
+行号: {candidate.line_start}
+函数: {candidate.function_name or "unknown"}
+Sink: {program_slice.sink}
+Source: {program_slice.source}
+描述: {(candidate.description or "")[:300]}
+
+代码上下文:
+```
+{context_lines}
+```
+
+评估标准:
+- critical: 无需认证即可远程触发，导致代码执行或系统控制
+- high: 可导致代码执行、内存破坏、或权限提升，但需要一定条件
+- medium: 需要特定输入或条件，可导致崩溃或信息泄露
+- low: 理论风险，实际利用困难；或只是最佳实践偏离
+
+请返回JSON: {{"severity":"critical|high|medium|low","reasoning":"简短理由"}}"""
+
+        try:
+            resp = self.llm_client.chat(
+                "你是安全审计专家，只输出JSON。",
+                prompt,
+                timeout=25,
+            )
+        except Exception:
+            return None
+
+        if not resp.ok:
+            return None
+        text = resp.content.strip()
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*?\}", text, re.S)
+            if match:
+                try:
+                    result = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    return None
+            else:
+                return None
+        severity = str(result.get("severity", "")).lower()
+        if severity not in {"critical", "high", "medium", "low"}:
+            return None
+        return {"severity": severity, "reasoning": str(result.get("reasoning", ""))}
+
     def _severity(self, total_score: int) -> str:
         if total_score >= 11:
             return "critical"
@@ -1163,8 +2100,9 @@ class VulnerabilityClassifier:
             return "medium"
         return "weak"
 
-    def _should_verify(self, vuln_type: str, evidence_strength: str, total_score: int) -> bool:
-        if vuln_type in {"dependency_vulnerability", "secret_leak", "supply_chain_config"}:
+    def _should_verify(self, vuln_type: VulnType, evidence_strength: str, total_score: int) -> bool:
+        # Non-source-code risk domains never enter dynamic verification
+        if not is_dynamic_verification_candidate(vuln_type):
             return False
         if evidence_strength == "strong":
             return True
@@ -1214,6 +2152,14 @@ class VulnerabilityClassifier:
             "dependency_vulnerability": ("Dependency risk", "Known vulnerable dependency requires reachability confirmation."),
             "secret_leak": ("Secret exposure", "Leaked credentials may enable downstream compromise."),
             "supply_chain_config": ("Supply-chain configuration risk", "Mutable or weak CI/dependency configuration may allow unreviewed code changes."),
+            "integer_overflow": ("Integer overflow", "Wraparound or truncation may bypass size checks."),
+            "out_of_bounds_read": ("Out-of-bounds read", "Attacker-controlled index or offset may read beyond buffer bounds."),
+            "out_of_bounds_write": ("Out-of-bounds write", "Attacker-controlled index or offset may write beyond buffer bounds."),
+            "use_after_free": ("Use-after-free", "Dangling pointer dereference after memory release."),
+            "double_free": ("Double free", "Freeing the same memory twice may corrupt allocator metadata."),
+            "null_dereference": ("Null dereference", "Null pointer access may crash or enable further exploitation."),
+            "resource_leak": ("Resource leak", "Unreleased memory/fd/handle may exhaust system resources."),
+            "weak_static_proof": ("Weak static clue", "Insufficient evidence to classify as a concrete finding."),
         }
         label, detail = mapping.get(vuln_type, ("Security impact", "Security impact requires manual confirmation."))
         if program_slice.missing_guards:
@@ -1235,7 +2181,8 @@ class VulnerabilityClassifier:
         return "evidence_only"
 
     def _verification_reason(self, vuln_type: str, evidence_strength: str, total_score: int) -> str:
-        if vuln_type in {"dependency_vulnerability", "secret_leak", "supply_chain_config"}:
+        vuln_type_enum = VulnType.from_string(vuln_type)
+        if not is_dynamic_verification_candidate(vuln_type_enum):
             return "Static evidence should be confirmed, but dynamic verification is not prioritized."
         if evidence_strength == "strong":
             return "Strong source-to-sink evidence justifies verification."
@@ -1255,6 +2202,14 @@ class VulnerabilityClassifier:
             "dependency_vulnerability": "Upgrade the affected dependency and confirm runtime reachability.",
             "secret_leak": "Rotate exposed credentials and move them to secure configuration storage.",
             "supply_chain_config": "Pin third-party actions and harden dependency automation configuration.",
+            "integer_overflow": "Validate size/offset arithmetic with checked operations or safe integer types.",
+            "out_of_bounds_read": "Add explicit bounds checks before array/pointer access.",
+            "out_of_bounds_write": "Add explicit bounds checks and use size-aware buffer operations.",
+            "use_after_free": "Set pointers to NULL after free and review object lifetime management.",
+            "double_free": "Ensure each allocation is freed exactly once with clear ownership semantics.",
+            "null_dereference": "Add null checks before pointer dereference.",
+            "resource_leak": "Ensure every allocation/open has a corresponding release/close path.",
+            "weak_static_proof": "Gather additional static or dynamic evidence before concluding.",
         }
         return mapping.get(vuln_type, "Add validation, bounds checks, and focused regression tests.")
 
@@ -1265,6 +2220,13 @@ class VulnerabilityClassifier:
             "path_traversal": ["../../../../etc/passwd", "..\\..\\..\\Windows\\win.ini"],
             "unsafe_memory_copy": ["A" * 4096],
             "unsafe_c_string_api": ["A" * 4096],
+            "integer_overflow": ["2147483647", "-2147483648"],
+            "out_of_bounds_read": ["A" * 4096],
+            "out_of_bounds_write": ["A" * 4096],
+            "use_after_free": [],
+            "double_free": [],
+            "null_dereference": [],
+            "resource_leak": [],
             "code_execution": ["__import__('os').system('id')"],
         }
         return mapping.get(vuln_type, ["manual-validation-payload"])
@@ -1279,34 +2241,70 @@ class VulnerabilityMiningAgent:
         llm_client: DeepSeekClient,
         event_sink: Callable[[str, str, str, dict[str, Any]], None] | None = None,
         tool_planner: ToolPlanner | None = None,
+        mining_director: Any | None = None,
     ) -> None:
         if isinstance(tool_runner, SecurityToolRunner):
             self.tool_runner = tool_runner.tool_runner
             self.tool_planner = tool_runner.planner
         else:
             self.tool_runner = tool_runner
-            self.tool_planner = tool_planner or ToolPlanner(self.tool_runner.registry, self.tool_runner.env)
+            self.tool_planner = tool_planner or ToolPlanner(
+                self.tool_runner.registry,
+                self.tool_runner.env,
+                availability_provider=self.tool_runner.list_tools,
+            )
         self.llm_client = llm_client
         self.event_sink = event_sink
         self.locator = DangerousFunctionLocator()
         self.slice_analyzer = SliceAnalyzer()
-        self.candidate_generator = CandidateGenerator()
+        self.candidate_generator = CandidateGenerator(llm_client=llm_client)
         self.aggregator = ClueAggregator()
-        self.classifier = VulnerabilityClassifier()
+        self.classifier = VulnerabilityClassifier(llm_client=llm_client)
+        # MiningDirector is optional; instantiate one if not injected
+        if mining_director:
+            self.mining_director = mining_director
+        else:
+            from .mining_director import MiningDirector as MD
+            self.mining_director = MD(llm_client)
 
-    def run(self, target: Path, profile: ProjectProfile, semantic_index: SemanticIndex) -> MiningResult:
+    def run(
+        self, target: Path, profile: ProjectProfile, semantic_index: SemanticIndex,
+        strategy: MiningStrategy | None = None,
+        mode: str = "standard",
+    ) -> MiningResult:
         result = MiningResult()
+        budget = AuditBudget.for_mode(mode)
+        usage = BudgetUsage(config_audit_enabled=budget.enable_config_audit)
+        result.budget = budget.to_dict()
         result.events.append(self._event("mine_vulnerabilities", "running", "mining started"))
 
+        # --- tool selection: merge planner recommendations with MiningDirector strategy ---
         recommendations = self.tool_planner.recommend_tools(
             "VulnerabilityMiningAgent",
             "mine_vulnerabilities",
             profile,
             target,
         )
+        planner_tool_order = [item.name for item in recommendations]
+        # Strategy-recommended tools override or augment the planner list
+        if strategy and strategy.tool_selections:
+            strategy_tool_names = {ts.name for ts in strategy.tool_selections}
+            # Prepend strategy tools that the planner didn't already recommend
+            extra_recs = [rec for rec in recommendations if rec.name not in strategy_tool_names]
+            # Build a merged list: strategy tools first (sorted by priority), then planner extras
+            merged: list[Any] = []
+            for ts in sorted(strategy.tool_selections, key=lambda x: x.priority):
+                matching = [r for r in recommendations if r.name == ts.name]
+                if matching:
+                    merged.append(matching[0])
+            merged.extend(extra_recs)
+            recommendations = merged
+            self._emit_step_start("tooling", f"strategy merged: {len(strategy.tool_selections)} director tools + {len(extra_recs)} planner extras", {})
+        final_tool_order = [item.name for item in recommendations]
+
         self._emit_step_start("tooling", "security tools selected", {"project_type": profile.project_type})
-        for invocation in self.tool_planner.build_invocations(recommendations, target):
-            result.tool_results.append(self.tool_runner.run(invocation))
+        invocations = self.tool_planner.build_invocations(recommendations, target)
+        result.tool_results = run_invocations_parallel(invocations, self.tool_runner)
         self._emit_step_done(
             "tooling",
             "security tools completed",
@@ -1314,24 +2312,71 @@ class VulnerabilityMiningAgent:
         )
 
         self._emit_step_start("dangerous_function_location", "locating dangerous anchors", {})
-        result.dangerous_functions = self.locator.locate(target, result.tool_results)
-        self._emit_step_done("dangerous_function_location", "anchors located", {"dangerous_functions": len(result.dangerous_functions)})
+        result.dangerous_functions = self.locator.locate(target, result.tool_results, budget, strategy)
+        usage.anchors = len(result.dangerous_functions)
+        usage.anchors_before_budget = usage.anchors + sum(self.locator.last_suppressed_counts.values())
+        usage.config_anchors_suppressed = self.locator.last_suppressed_counts.get("config", 0)
+        usage.weak_signal_anchors_suppressed = self.locator.last_suppressed_counts.get("weak_signal", 0)
+        self._emit_step_done(
+            "dangerous_function_location",
+            "anchors located",
+            {
+                "dangerous_functions": len(result.dangerous_functions),
+                "budget": budget.to_dict(),
+                "suppressed": self.locator.last_suppressed_counts,
+            },
+        )
 
         self._emit_step_start("slicing", "building structured slices", {"dangerous_functions": len(result.dangerous_functions)})
-        result.program_slices = self.slice_analyzer.analyze(target, result.dangerous_functions, semantic_index, self.llm_client)
+        result.program_slices = self.slice_analyzer.analyze(
+            target, result.dangerous_functions, semantic_index, self.llm_client, budget, strategy
+        )
+        usage.slices = len(result.program_slices)
         self._emit_step_done("slicing", "structured slices ready", {"program_slices": len(result.program_slices)})
 
         self._emit_step_start("candidate_generation", "generating candidates in batches", {"program_slices": len(result.program_slices)})
-        result.candidates = self.candidate_generator.generate(result.program_slices, self.llm_client)
-        self._emit_step_done("candidate_generation", "candidates generated", {"candidates": len(result.candidates)})
+        result.candidates = self.candidate_generator.generate(result.program_slices, self.llm_client, budget)
+        usage.candidates = len(result.candidates)
+        usage.llm_calls = self.candidate_generator.llm_calls_used
+        self._emit_step_done(
+            "candidate_generation",
+            "candidates generated",
+            {"candidates": len(result.candidates), "llm_calls": usage.llm_calls},
+        )
 
         self._emit_step_start("clue_aggregation", "merging candidate clues", {"candidates": len(result.candidates)})
         result.aggregated_candidates = self.aggregator.aggregate(result.candidates)
+        usage.aggregated_candidates = len(result.aggregated_candidates)
         self._emit_step_done("clue_aggregation", "candidate clues merged", {"aggregated_candidates": len(result.aggregated_candidates)})
 
+        # --- apply MiningDirector candidate prioritisation ---
+        candidate_top_before = [item.id for item in result.aggregated_candidates[:10]]
+        if strategy and result.aggregated_candidates:
+            result.aggregated_candidates = self.mining_director.prioritize_candidates(
+                result.aggregated_candidates, strategy, profile
+            )
+            self._emit_step_start("mining_director_prioritize", "candidates reordered by strategy", {"count": len(result.aggregated_candidates)})
+        candidate_top_after = [item.id for item in result.aggregated_candidates[:10]]
+
         self._emit_step_start("vulnerability_classification", "classifying findings", {"candidates": len(result.aggregated_candidates)})
-        result.findings = self.classifier.classify(result.aggregated_candidates, result.program_slices, self.llm_client)
+        result.findings = self.classifier.classify(result.aggregated_candidates, result.program_slices, self.llm_client, budget)
+        usage.findings = len(result.findings)
+        result.budget_usage = usage.to_dict()
+        result.strategy_effects = {
+            "planner_tool_order": planner_tool_order,
+            "final_tool_order": final_tool_order,
+            "anchor_top_ids": [item.id for item in result.dangerous_functions[:10]],
+            "slice_top_ids": [item.id for item in result.program_slices[:10]],
+            "candidate_top_before": candidate_top_before,
+            "candidate_top_after": candidate_top_after,
+            "verification_queue_top_ids": [item.id for item in result.findings if item.should_verify][:10],
+        }
         self._emit_step_done("vulnerability_classification", "findings classified", {"findings": len(result.findings)})
+
+        # Save strategy for debug output
+        if strategy:
+            strategy.strategy_effects = result.strategy_effects
+            result.strategy = strategy.to_dict()
 
         result.events.append(
             self._event(

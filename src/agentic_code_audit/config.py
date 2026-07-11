@@ -44,6 +44,9 @@ class Settings:
     max_file_size: int
     tool_timeout: int
     auto_build_native: bool
+    sandbox_container: str = "agentic-code-audit-sandbox"
+    sandbox_image: str = "agentic-code-audit-sandbox:local"
+    build_network_enabled: bool = False
 
     @property
     def deepseek_api_key(self) -> str:
@@ -91,4 +94,7 @@ class Settings:
             max_file_size=int_value("AUDIT_MAX_FILE_SIZE", 1_048_576),
             tool_timeout=int_value("AUDIT_TOOL_TIMEOUT", 120),
             auto_build_native=bool_value("AUDIT_AUTO_BUILD_NATIVE", False),
+            sandbox_container=value("AUDIT_SANDBOX_CONTAINER", "agentic-code-audit-sandbox"),
+            sandbox_image=value("AUDIT_SANDBOX_IMAGE", "agentic-code-audit-sandbox:local"),
+            build_network_enabled=bool_value("AUDIT_BUILD_NETWORK_ENABLED", False),
         )

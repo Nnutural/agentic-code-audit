@@ -1,0 +1,44 @@
+{
+  "rules": [
+    {"pattern": "\\bmemcpy\\s*\\(", "api": "memcpy", "vuln_type": "unsafe_memory_copy", "category": "memory", "confidence": 0.66},
+    {"pattern": "\\bmemmove\\s*\\(", "api": "memmove", "vuln_type": "unsafe_memory_copy", "category": "memory", "confidence": 0.62},
+    {"pattern": "\\bmemcmp\\s*\\(", "api": "memcmp", "vuln_type": "out_of_bounds_read", "category": "memory", "confidence": 0.55, "weak_signal": true},
+    {"pattern": "\\bstd::copy\\b", "api": "std::copy", "vuln_type": "unsafe_memory_copy", "category": "memory", "confidence": 0.52, "weak_signal": true},
+    {"pattern": "\\bstd::memcpy\\b", "api": "std::memcpy", "vuln_type": "unsafe_memory_copy", "category": "memory", "confidence": 0.66},
+
+    {"pattern": "\\bstrcpy\\s*\\(", "api": "strcpy", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.84},
+    {"pattern": "\\bstrcat\\s*\\(", "api": "strcat", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.80},
+    {"pattern": "\\bsprintf\\s*\\(", "api": "sprintf", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.78},
+    {"pattern": "\\bgets\\s*\\(", "api": "gets", "vuln_type": "unsafe_c_string_api", "category": "memory", "confidence": 0.90},
+    {"pattern": "\\bscanf\\s*\\(", "api": "scanf", "vuln_type": "unsafe_c_string_api", "category": "input", "confidence": 0.66},
+    {"pattern": "\\bsscanf\\s*\\(", "api": "sscanf", "vuln_type": "unsafe_c_string_api", "category": "input", "confidence": 0.56},
+
+    {"pattern": "\\bsystem\\s*\\(", "api": "system", "vuln_type": "command_injection", "category": "command", "confidence": 0.78},
+    {"pattern": "\\bpopen\\s*\\(", "api": "popen", "vuln_type": "command_injection", "category": "command", "confidence": 0.74},
+    {"pattern": "\\bexec[lv]p?\\s*\\(", "api": "exec", "vuln_type": "command_injection", "category": "command", "confidence": 0.82},
+    {"pattern": "\\bCreateProcess\\b", "api": "CreateProcess", "vuln_type": "command_injection", "category": "command", "confidence": 0.60},
+
+    {"pattern": "\\bnew\\s+\\w+\\[", "api": "new[]", "vuln_type": "resource_leak", "category": "memory", "confidence": 0.42, "weak_signal": true},
+    {"pattern": "\\bmalloc\\s*\\(", "api": "malloc", "vuln_type": "resource_leak", "category": "memory", "confidence": 0.44, "weak_signal": true},
+    {"pattern": "\\bcalloc\\s*\\(", "api": "calloc", "vuln_type": "resource_leak", "category": "memory", "confidence": 0.44},
+    {"pattern": "\\brealloc\\s*\\(", "api": "realloc", "vuln_type": "resource_leak", "category": "memory", "confidence": 0.48},
+    {"pattern": "\\bfopen\\s*\\(", "api": "fopen", "vuln_type": "resource_leak", "category": "file", "confidence": 0.40, "weak_signal": true},
+    {"pattern": "\\bopen\\s*\\(", "api": "open", "vuln_type": "resource_leak", "category": "file", "confidence": 0.40, "weak_signal": true},
+    {"pattern": "\\bmmap\\s*\\(", "api": "mmap", "vuln_type": "resource_leak", "category": "memory", "confidence": 0.38, "weak_signal": true},
+
+    {"pattern": "\\bfree\\s*\\(", "api": "free", "vuln_type": "use_after_free", "category": "memory", "confidence": 0.40, "weak_signal": true},
+    {"pattern": "\\bdelete\\s*\\[", "api": "delete[]", "vuln_type": "use_after_free", "category": "memory", "confidence": 0.40},
+    {"pattern": "\\bdelete\\s+", "api": "delete", "vuln_type": "use_after_free", "category": "memory", "confidence": 0.40},
+
+    {"pattern": "\\[\\s*\\w+\\s*\\]", "api": "array_index", "vuln_type": "out_of_bounds_read", "category": "memory", "confidence": 0.30, "weak_signal": true},
+    {"pattern": "\\[\\s*\\w+\\s*\\+\\s*\\w+\\s*\\]", "api": "array_index_offset", "vuln_type": "out_of_bounds_read", "category": "memory", "confidence": 0.38},
+
+    {"pattern": "\\breinterpret_cast\\s*<", "api": "reinterpret_cast", "vuln_type": "other", "category": "type_safety", "confidence": 0.28},
+    {"pattern": "\\(\\s*\\w+\\s*\\*\\s*\\)\\s*\\w+", "api": "c_style_cast", "vuln_type": "integer_overflow", "category": "type_safety", "confidence": 0.22, "weak_signal": true},
+
+    {"pattern": "\\bstoi\\s*\\(", "api": "stoi", "vuln_type": "integer_overflow", "category": "conversion", "confidence": 0.40},
+    {"pattern": "\\bstol\\s*\\(", "api": "stol", "vuln_type": "integer_overflow", "category": "conversion", "confidence": 0.38},
+    {"pattern": "\\batoi\\s*\\(", "api": "atoi", "vuln_type": "integer_overflow", "category": "conversion", "confidence": 0.44},
+    {"pattern": "\\batol\\s*\\(", "api": "atol", "vuln_type": "integer_overflow", "category": "conversion", "confidence": 0.42}
+  ]
+}

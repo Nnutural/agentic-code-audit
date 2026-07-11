@@ -6,7 +6,7 @@ from typing import Any
 
 from ..config import Settings
 from ..models import AgentEvent, ProjectProfile, ToolResult, utc_now
-from ..tools.runner import ToolPlanner, ToolRunner
+from ..tools.runner import ToolPlanner, ToolRunner, run_invocations_parallel
 from .profiler import ProjectProfiler
 
 
@@ -117,7 +117,11 @@ class ReconAgent:
         self.settings = settings
         self.profiler = ProjectProfiler(settings)
         self.tool_runner = tool_runner or ToolRunner(settings)
-        self.tool_planner = tool_planner or ToolPlanner(self.tool_runner.registry, self.tool_runner.env)
+        self.tool_planner = tool_planner or ToolPlanner(
+            self.tool_runner.registry,
+            self.tool_runner.env,
+            availability_provider=self.tool_runner.list_tools,
+        )
         self.interpreter = ReconInterpreter()
 
     def run(self, target: Path) -> tuple[ProjectProfile, AgentEvent]:
@@ -149,15 +153,12 @@ class ReconAgent:
         return profile, event
 
     def _run_recon_tools(self, target: Path, recommendations: list[Any]) -> list[ToolResult]:
-        results: list[ToolResult] = []
         runnable = {"osv-scanner", "pip-audit", "npm-audit", "cargo-audit", "gosec"}
         invocations = self.tool_planner.build_invocations(
             [item for item in recommendations if item.name in runnable],
             target,
         )
-        for invocation in invocations:
-            results.append(self.tool_runner.run(invocation))
-        return results
+        return run_invocations_parallel(invocations, self.tool_runner)
 
     def _recommendation_detail(self, item: Any) -> dict[str, Any]:
         return {

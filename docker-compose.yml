@@ -13,6 +13,7 @@ services:
     environment:
       AUDIT_TOOL_TIMEOUT: "180"
       AUDIT_SANDBOX_CONTAINER: "agentic-code-audit-sandbox"
+      AUDIT_SANDBOX_IMAGE: "agentic-code-audit-sandbox:local"
       DEEPSEEK_MODEL: "deepseek-v4-pro"
     volumes:
       - ./.env:/app/.env:ro
@@ -45,6 +46,8 @@ services:
         APT_SECURITY_MIRROR: ${APT_SECURITY_MIRROR:-https://mirrors.ustc.edu.cn/debian-security}
     image: agentic-code-audit-sandbox:local
     network_mode: "none"
+    mem_limit: 2g
+    cpus: 2
     command: ["sleep", "infinity"]
     volumes:
       - ./runs:/workspace/runs

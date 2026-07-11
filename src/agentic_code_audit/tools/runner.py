@@ -3,17 +3,76 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from ..config import Settings
 from ..models import ArtifactRecord, ProjectProfile, ToolResult, utc_now
+
+# ---------------------------------------------------------------------------
+# Tools that must execute inside the sandbox container (docker exec)
+# Everything else runs locally in the backend process.
+# ---------------------------------------------------------------------------
+SANDBOX_TOOLS: set[str] = {
+    # C/C++ static analysis
+    "cppcheck",
+    "clang-tidy",
+    # C/C++ build chain
+    "cmake",
+    "make",
+    "ninja",
+    "gcc",
+    "g++",
+    "clang",
+    "clang++",
+    "pkg-config",
+    # C/C++ debugging / verification
+    "valgrind",
+    "gdb",
+    "lldb",
+    # Code navigation
+    "ctags",
+    # Multi-language runtimes (not installed in backend)
+    "go",
+    "gosec",
+    "cargo",
+    "cargo-audit",
+    "java",
+    "mvn",
+    "gradle",
+    "php",
+    "composer",
+}
+
+# Path translation: backend container → sandbox container (Docker volumes)
+SANDBOX_PATH_MAP: list[tuple[str, str]] = [
+    ("/app/runs", "/workspace/runs"),
+    ("/app/reports", "/workspace/reports"),
+]
+
+
+def _translate_path_for_sandbox(host_path: str) -> str:
+    """Map a backend-container path into the corresponding sandbox-container path."""
+    for backend_prefix, sandbox_prefix in SANDBOX_PATH_MAP:
+        if host_path.startswith(backend_prefix):
+            return sandbox_prefix + host_path[len(backend_prefix):]
+    return host_path
+
+
+def _translate_command_for_sandbox(command: list[str]) -> list[str]:
+    """Translate all path-like arguments in a command for sandbox execution."""
+    translated: list[str] = []
+    for arg in command:
+        translated.append(_translate_path_for_sandbox(arg))
+    return translated
 
 
 @dataclass(frozen=True)
@@ -39,6 +98,9 @@ class ToolAvailability:
     version: str = ""
     path: str = ""
     reason: str = ""
+    execution_location: str = "backend"
+    container: str = ""
+    network_policy: str = "default"
 
 
 @dataclass
@@ -131,7 +193,7 @@ class ToolRegistry:
             "npm-audit": ["npm", "audit", "--json"],
             "cppcheck": [
                 "cppcheck",
-                "--enable=warning,style,performance,portability",
+                "--enable=all",
                 "--xml",
                 "--xml-version=2",
                 "--inline-suppr",
@@ -149,6 +211,7 @@ class ToolRegistry:
             "g++": ["g++", "--version"],
             "clang": ["clang", "--version"],
             "clang++": ["clang++", "--version"],
+            "ctags": ["ctags", "--version"],
             "valgrind": ["valgrind", "--version"],
             "gdb": ["gdb", "--version"],
             "lldb": ["lldb", "--version"],
@@ -244,7 +307,7 @@ class ToolRegistry:
             ("gosec", "gosec", "go-static-analysis"),
             ("cargo-audit", "cargo", "rust-dependency-vulnerability"),
         ]:
-            parser = "text" if name == "clang-tidy" else name
+            parser = "clang-tidy" if name == "clang-tidy" else ("text" if name == "codeql" else name)
             self.register(ToolDefinition(name=name, executable=executable, capability=capability, parser=parser))
         for name, executable, capability, languages in [
             ("docker", "docker", "environment", ()),
@@ -255,6 +318,7 @@ class ToolRegistry:
             ("g++", "g++", "build", ("C++",)),
             ("clang", "clang", "build", ("C",)),
             ("clang++", "clang++", "build", ("C++",)),
+            ("ctags", "ctags", "code-navigation", ("C", "C++")),
             ("valgrind", "valgrind", "verification", ("C", "C++")),
             ("gdb", "gdb", "verification", ("C", "C++")),
             ("lldb", "lldb", "verification", ("C", "C++")),
@@ -341,11 +405,19 @@ class ToolRegistry:
 class ToolPlanner:
     """Plan which tools to run for a given phase while preserving registry semantics."""
 
-    def __init__(self, registry: ToolRegistry, env: dict[str, str]):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        env: dict[str, str],
+        availability_provider: Callable[[], list[ToolAvailability]] | None = None,
+    ):
         self.registry = registry
         self.env = env
+        self.availability_provider = availability_provider
 
     def list_available_tools(self, profile: ProjectProfile | None = None) -> list[ToolAvailability]:
+        if self.availability_provider:
+            return self.availability_provider()
         return self.registry.availability(self.env)
 
     def recommend_tools(
@@ -357,7 +429,7 @@ class ToolPlanner:
     ) -> list[ToolRecommendation]:
         target = target.resolve()
         definitions = self._recommend_definitions(agent, phase, profile, target)
-        availability = {item.name: item for item in self.registry.availability(self.env)}
+        availability = {item.name: item for item in self.list_available_tools(profile)}
         recommendations: list[ToolRecommendation] = []
         for definition in definitions:
             item = availability.get(definition.name) or ToolAvailability(
@@ -450,6 +522,9 @@ class ToolParsers:
         if parser == "cppcheck":
             findings = self._cppcheck_findings(text)
             return {"errors": findings}, findings, f"findings={len(findings)}"
+        if parser == "clang-tidy":
+            findings = self._clang_tidy_findings(text)
+            return {"findings": findings}, findings, f"findings={len(findings)}"
         if parser in {"semgrep", "gitleaks", "osv-scanner", "bandit", "npm-audit", "pip-audit", "cargo-audit", "gosec"}:
             raw = self._json(text)
             findings = self._findings(parser, raw)
@@ -518,6 +593,70 @@ class ToolParsers:
             if location is not None:
                 item.update({f"location_{key}": value for key, value in location.attrib.items()})
             findings.append(item)
+        return findings
+
+    def _clang_tidy_findings(self, text: str) -> list[dict[str, Any]]:
+        """Parse clang-tidy text output.
+
+        Standard format:
+            /path/to/file.cpp:42:5: warning: message [check-name]
+            /path/to/file.cpp:100:10: error: another message [another-check]
+
+        Also handles --export-fixes=- YAML output as fallback.
+        """
+        if not text.strip():
+            return []
+        findings: list[dict[str, Any]] = []
+
+        # Try YAML (--export-fixes=-) first
+        if text.strip().startswith("---"):
+            findings = self._clang_tidy_yaml_findings(text)
+            if findings:
+                return findings
+
+        # Fallback: regex on standard text output
+        pattern = re.compile(
+            r"^(.+?):(\d+):(\d+):\s*(warning|error|note|fatal error):\s*(.+?)\s*\[(.+?)\]$",
+            re.MULTILINE,
+        )
+        for match in pattern.finditer(text):
+            findings.append({
+                "file": match.group(1).strip(),
+                "line": int(match.group(2)),
+                "column": int(match.group(3)),
+                "severity": match.group(4),
+                "message": match.group(5).strip(),
+                "check": match.group(6).strip(),
+            })
+        return findings
+
+    def _clang_tidy_yaml_findings(self, text: str) -> list[dict[str, Any]]:
+        """Parse clang-tidy --export-fixes=- YAML output."""
+        findings: list[dict[str, Any]] = []
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            return []
+        try:
+            docs = list(yaml.safe_load_all(text))
+        except Exception:
+            return []
+        for doc in docs:
+            if not isinstance(doc, dict):
+                continue
+            diagnostics = doc.get("Diagnostics") or []
+            for diag in diagnostics:
+                if not isinstance(diag, dict):
+                    continue
+                findings.append({
+                    "file": str(diag.get("FilePath") or ""),
+                    "line": 0,  # FileOffset-based line calculation is approximate; use text format for accuracy
+                    "column": 0,
+                    "severity": str(diag.get("DiagnosticLevel") or "warning"),
+                    "message": str(diag.get("Message") or ""),
+                    "check": str(diag.get("DiagnosticName") or ""),
+                    "offset": int(diag.get("FileOffset") or 0),
+                })
         return findings
 
 
@@ -599,6 +738,63 @@ class ArtifactManager:
         return artifact_id, str(path)
 
 
+def run_invocations_parallel(
+    invocations: list[ToolInvocation],
+    tool_runner: "ToolRunner",
+    max_workers: int = 6,
+    cancel_callback: Callable[[], bool] | None = None,
+) -> list[ToolResult]:
+    """Run multiple tool invocations in parallel using a thread pool.
+
+    All tools are independent subprocess calls — ThreadPoolExecutor is ideal because
+    the GIL is released during subprocess I/O. Individual tool failures do not abort
+    other tools; results are returned in the original invocation order.
+    """
+    if not invocations:
+        return []
+
+    if len(invocations) == 1:
+        return [tool_runner.run(invocations[0], cancel_callback=cancel_callback)]
+
+    workers = min(max_workers, len(invocations))
+    results: dict[int, ToolResult] = {}
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_index: dict[Any, int] = {}
+        for i, invocation in enumerate(invocations):
+            future = executor.submit(tool_runner.run, invocation, cancel_callback)
+            future_to_index[future] = i
+
+        for future in as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                # Synthesize an error result so one crash doesn't drop the whole slot
+                results[idx] = _synthetic_error_result(invocations[idx], exc)
+
+    return [results[i] for i in range(len(invocations))]
+
+
+def _synthetic_error_result(invocation: ToolInvocation, exc: Exception) -> ToolResult:
+    """Return a ToolResult representing an unhandled execution error."""
+    return ToolResult(
+        tool=invocation.tool,
+        status="error",
+        run_id="",
+        command=invocation.command,
+        summary=f"parallel execution error: {exc}",
+        raw={"exception": str(exc)},
+        findings=[],
+        exit_code=-1,
+        duration_ms=0,
+        cache_hit=False,
+        artifact_records=[],
+        started_at=utc_now(),
+        finished_at=utc_now(),
+    )
+
+
 class ToolRunner:
     def __init__(
         self,
@@ -606,17 +802,267 @@ class ToolRunner:
         registry: ToolRegistry | None = None,
         cache: ToolCache | None = None,
         artifacts: ArtifactManager | None = None,
+        sandbox_container: str = "",
     ):
         self.settings = settings
         self.registry = registry or ToolRegistry()
         self.parsers = ToolParsers()
         self.env = self._build_env()
+        self.sandbox_container = sandbox_container or getattr(settings, "sandbox_container", "")
         app_root = Path.cwd()
         self.cache = cache or ToolCache(app_root / "data" / "tool-cache")
         self.artifacts = artifacts or ArtifactManager(app_root / "reports" / "tool-artifacts")
 
     def list_tools(self) -> list[ToolAvailability]:
-        return self.registry.availability(self.env)
+        return [self.check_tool(tool.name) for tool in self.registry.all()]
+
+    def check_tool(self, name: str) -> ToolAvailability:
+        if name in SANDBOX_TOOLS:
+            return self._check_sandbox_tool(name)
+        availability = self.registry.check_tool(name, self.env)
+        availability.execution_location = "backend"
+        availability.network_policy = "backend_default"
+        return availability
+
+    # ------------------------------------------------------------------
+    # Sandbox execution helpers
+    # ------------------------------------------------------------------
+
+    def _sandbox_available(self) -> bool:
+        """Check whether the sandbox container is running and reachable."""
+        if not self.sandbox_container:
+            return False
+        try:
+            proc = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", self.sandbox_container],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            return proc.stdout.strip() == "true"
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _check_sandbox_tool(self, tool: str) -> ToolAvailability:
+        """Check whether *tool* is available inside the sandbox container."""
+        definition = self.registry.get(tool)
+        if not self._sandbox_available():
+            return ToolAvailability(
+                name=definition.name,
+                executable=definition.executable,
+                available=False,
+                required=definition.required,
+                capability=definition.capability,
+                reason=f"Sandbox container '{self.sandbox_container}' is not running or docker is unavailable.",
+                execution_location="sandbox",
+                container=self.sandbox_container,
+                network_policy="none",
+            )
+        try:
+            proc = subprocess.run(
+                ["docker", "exec", self.sandbox_container, "which", definition.executable],
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return ToolAvailability(
+                name=definition.name,
+                executable=definition.executable,
+                available=False,
+                required=definition.required,
+                capability=definition.capability,
+                reason=f"Cannot check sandbox tool: {exc}",
+                execution_location="sandbox",
+                container=self.sandbox_container,
+                network_policy="none",
+            )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return ToolAvailability(
+                name=definition.name,
+                executable=definition.executable,
+                available=False,
+                required=definition.required,
+                capability=definition.capability,
+                reason=f"{definition.executable} is not installed in sandbox container '{self.sandbox_container}'.",
+                execution_location="sandbox",
+                container=self.sandbox_container,
+                network_policy="none",
+            )
+        sandbox_path = proc.stdout.strip()
+        try:
+            version_proc = subprocess.run(
+                ["docker", "exec", self.sandbox_container, sandbox_path, "--version"],
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            version_line = (version_proc.stdout or version_proc.stderr).strip().splitlines()
+            version = version_line[0][:200] if version_line else ""
+        except (OSError, subprocess.TimeoutExpired):
+            version = ""
+        return ToolAvailability(
+            name=definition.name,
+            executable=definition.executable,
+            available=True,
+            required=definition.required,
+            capability=definition.capability,
+            version=version,
+            path=sandbox_path,
+            execution_location="sandbox",
+            container=self.sandbox_container,
+            network_policy="none",
+        )
+
+    def _run_in_sandbox(
+        self,
+        invocation: ToolInvocation,
+        definition: ToolDefinition,
+        run_id: str,
+        cancel_callback: Callable[[], bool] | None = None,
+    ) -> ToolResult:
+        """Execute *invocation* inside the sandbox container via docker exec."""
+
+        if cancel_callback and cancel_callback():
+            return ToolResult(
+                tool=invocation.tool,
+                status="cancelled",
+                run_id=run_id,
+                command=invocation.command,
+                summary=f"{invocation.tool} cancelled before sandbox execution.",
+                finished_at=utc_now(),
+            )
+
+        # --- availability check ---
+        availability = self._check_sandbox_tool(invocation.tool)
+        if not availability.available:
+            return ToolResult(
+                tool=invocation.tool,
+                status="blocked",
+                run_id=run_id,
+                command=invocation.command,
+                summary=availability.reason or f"{invocation.tool} is unavailable in sandbox.",
+                raw={"availability": asdict_availability(availability), "reason": availability.reason},
+                finished_at=utc_now(),
+            )
+
+        # --- translate paths for sandbox ---
+        sandbox_command = _translate_command_for_sandbox(invocation.command)
+        sandbox_cwd = _translate_path_for_sandbox(str(invocation.cwd.resolve()))
+
+        docker_command = [
+            "docker", "exec",
+            "-w", sandbox_cwd,
+            self.sandbox_container,
+            *sandbox_command,
+        ]
+
+        timeout = invocation.timeout or definition.default_timeout or self.settings.tool_timeout
+        cache_key = self.cache.key_for(invocation, availability.version)
+        if invocation.cacheable and definition.cacheable:
+            cached = self.cache.get(cache_key)
+            if cached:
+                return self._result_from_cache(invocation, cached, cache_key)
+
+        # --- execute ---
+        started_at = utc_now()
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            docker_command,
+            cwd=str(invocation.cwd),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        stdout = ""
+        stderr = ""
+        cancelled = False
+        timed_out = False
+        while True:
+            if cancel_callback and cancel_callback():
+                cancelled = True
+                self._terminate(proc)
+                break
+            elapsed = time.monotonic() - started
+            if timeout and elapsed >= timeout:
+                timed_out = True
+                self._terminate(proc)
+                break
+            try:
+                stdout, stderr = proc.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        if cancelled or timed_out:
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._kill(proc)
+                stdout, stderr = proc.communicate()
+        duration_ms = int((time.monotonic() - started) * 1000)
+
+        # --- artifacts ---
+        stdout_record = self._write_artifact(invocation.tool, "stdout.log", stdout, "tool_stdout", run_id)
+        stderr_record = self._write_artifact(invocation.tool, "stderr.log", stderr, "tool_stderr", run_id)
+        raw, findings, parse_summary = self.parsers.parse(invocation.parser, stdout, stderr)
+        parsed_text = self._serialize_parsed(raw)
+        parsed_record = self._write_artifact(invocation.tool, "parsed.json", parsed_text, "tool_parsed", run_id)
+        artifact_records = [stdout_record, stderr_record, parsed_record]
+
+        if cancelled:
+            return ToolResult(
+                tool=invocation.tool, status="cancelled", run_id=run_id,
+                command=invocation.command,
+                summary=f"{invocation.tool} (sandbox) cancelled.",
+                raw=raw, findings=findings, exit_code=proc.returncode,
+                duration_ms=duration_ms,
+                stdout_artifact_id=stdout_record.id, stderr_artifact_id=stderr_record.id,
+                parsed_artifact_id=parsed_record.id,
+                cache_key=cache_key, cache_hit=False,
+                artifact_records=artifact_records,
+                started_at=started_at, finished_at=utc_now(),
+            )
+        if timed_out:
+            return ToolResult(
+                tool=invocation.tool, status="timeout", run_id=run_id,
+                command=invocation.command,
+                summary=f"{invocation.tool} (sandbox) timed out after {timeout}s.",
+                raw=raw, findings=findings, exit_code=proc.returncode,
+                duration_ms=duration_ms,
+                stdout_artifact_id=stdout_record.id, stderr_artifact_id=stderr_record.id,
+                parsed_artifact_id=parsed_record.id,
+                cache_key=cache_key, cache_hit=False,
+                artifact_records=artifact_records,
+                started_at=started_at, finished_at=utc_now(),
+            )
+
+        status = "ok" if proc.returncode in (0, 1) else "error"
+        summary = f"sandbox; exit_code={proc.returncode}; {parse_summary}"
+        result = ToolResult(
+            tool=invocation.tool, status=status, run_id=run_id,
+            command=invocation.command,
+            summary=summary, raw=raw, findings=findings,
+            exit_code=proc.returncode, duration_ms=duration_ms,
+            stdout_artifact_id=stdout_record.id, stderr_artifact_id=stderr_record.id,
+            parsed_artifact_id=parsed_record.id,
+            cache_key=cache_key, cache_hit=False,
+            artifact_records=artifact_records,
+            started_at=started_at, finished_at=utc_now(),
+        )
+        if invocation.cacheable and definition.cacheable:
+            self.cache.put(cache_key, {"result": result_to_dict(result)})
+        return result
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -624,8 +1070,18 @@ class ToolRunner:
         cancel_callback: Callable[[], bool] | None = None,
     ) -> ToolResult:
         definition = self.registry.get(invocation.tool)
-        availability = self.registry.check_tool(invocation.tool, self.env)
         run_id = str(uuid.uuid4())
+
+        # -----------------------------------------------------------------
+        # Route C/C++ and multi-language tools through the sandbox container
+        # -----------------------------------------------------------------
+        if invocation.tool in SANDBOX_TOOLS:
+            return self._run_in_sandbox(invocation, definition, run_id, cancel_callback)
+
+        # -----------------------------------------------------------------
+        # Local execution path
+        # -----------------------------------------------------------------
+        availability = self.registry.check_tool(invocation.tool, self.env)
         if cancel_callback and cancel_callback():
             return ToolResult(
                 tool=invocation.tool,
@@ -877,7 +1333,11 @@ class SecurityToolRunner:
     ):
         self.tool_runner = tool_runner or ToolRunner(settings)
         self.registry = self.tool_runner.registry
-        self.planner = tool_planner or ToolPlanner(self.registry, self.tool_runner.env)
+        self.planner = tool_planner or ToolPlanner(
+            self.registry,
+            self.tool_runner.env,
+            availability_provider=self.tool_runner.list_tools,
+        )
         self.event_sink = event_sink
 
     def list_tools(self) -> list[ToolAvailability]:
@@ -893,7 +1353,27 @@ class SecurityToolRunner:
     ) -> list[ToolResult]:
         recommendations = self.planner.recommend_tools(agent, phase, profile, target)
         invocations = self.planner.build_invocations(recommendations, target)
-        return [self._run_invocation(invocation, cancel_callback=cancel_callback) for invocation in invocations]
+        # Emit tool_start for all tools before parallel execution
+        for invocation in invocations:
+            self._emit("ToolModule", "tool_start", f"{invocation.tool} started", {"tool": invocation.tool})
+        results = run_invocations_parallel(invocations, self.tool_runner, cancel_callback=cancel_callback)
+        for result in results:
+            self._emit(
+                "ToolModule",
+                "tool_end",
+                f"{result.tool} finished: {result.status}; {result.summary}",
+                {
+                    "tool": result.tool,
+                    "run_id": result.run_id,
+                    "status": result.status,
+                    "summary": result.summary,
+                    "command": result.command,
+                    "cache_hit": result.cache_hit,
+                    "exit_code": result.exit_code,
+                    "duration_ms": result.duration_ms,
+                },
+            )
+        return results
 
     def run_semgrep(self, target: Path) -> ToolResult:
         return self._run_invocation(self.registry.build_invocation("semgrep", target))
@@ -997,4 +1477,7 @@ def asdict_availability(availability: ToolAvailability) -> dict[str, Any]:
         "version": availability.version,
         "path": availability.path,
         "reason": availability.reason,
+        "execution_location": availability.execution_location,
+        "container": availability.container,
+        "network_policy": availability.network_policy,
     }

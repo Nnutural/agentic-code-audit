@@ -39,3 +39,5 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+testpaths = ["tests"]
+norecursedirs = [".git", ".pytest_cache", "build", "dist", "frontend/node_modules", "runs"]

@@ -93,6 +93,7 @@ DEPENDENCY_FILES = {
 
 BUILD_FILES = {
     "CMakeLists.txt",
+    "compile_commands.json",
     "Makefile",
     "configure",
     "autogen.sh",
@@ -263,6 +264,10 @@ class ProjectProfiler:
         if name == "CMakeLists.txt":
             entries.append(self._entry("cmake_build", rel, "cmake -S . -B build -G Ninja && cmake --build build", "CMakeLists.txt detected", 0.95))
             entries.append(self._entry("cmake_sanitizer_build", rel, "cmake -S . -B build-asan -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g' && cmake --build build-asan", "CMake supports sanitizer-style native builds", 0.75))
+            # Record how to generate compile_commands.json
+            entries.append(self._entry("compile_commands_generate", rel, "cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "compile_commands.json can be generated via CMake", 0.92))
+        elif name == "compile_commands.json":
+            entries.append(self._entry("compile_database", rel, "clang-tidy -p . && clangd --check=.", "compile_commands.json is present; enables clang-tidy, clangd, and bear", 0.98))
         elif name in {"Makefile", "makefile"}:
             entries.append(self._entry("make_build", rel, "make -j$(nproc)", "Makefile detected", 0.9))
         elif name in {"configure", "autogen.sh"}:

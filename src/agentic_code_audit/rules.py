@@ -16,7 +16,11 @@ class RulesLoader:
             "javascript.dangerous_apis": self.root / "javascript" / "dangerous_apis.yml",
             "cpp.dangerous_functions": self.root / "cpp" / "dangerous_functions.yml",
             "cpp.sources": self.root / "cpp" / "sources.yml",
+            "cpp.sinks": self.root / "cpp" / "sinks.yml",
             "cpp.sanitizers": self.root / "cpp" / "sanitizers.yml",
+            "cpp.guards": self.root / "cpp" / "guards.yml",
+            "cpp.parser_patterns": self.root / "cpp" / "parser_patterns.yml",
+            "cpp.cwe_mapping": self.root / "cpp" / "cwe_mapping.yml",
         }
         loaded: dict[str, Any] = {}
         for key, path in files.items():

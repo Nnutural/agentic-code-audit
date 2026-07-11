@@ -42,6 +42,7 @@ RUN mkdir -p .tools/bin \
     && rm -rf /tmp/gitleaks.tar.gz /tmp/docker.tgz /tmp/docker
 
 COPY src ./src
+COPY rules ./rules
 COPY examples ./examples
 COPY docs ./docs
 COPY scripts ./scripts

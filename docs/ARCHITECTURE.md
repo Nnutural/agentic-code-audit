@@ -96,13 +96,21 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 - 生成文件
 - checker 结论
 
+运行时逻辑上分为三种模式，共用 `agentic-code-audit-sandbox:local` 镜像：
+
+- `analysis`: 复用 Compose 中长期运行的无网络 sandbox，执行 cppcheck、clang-tidy、ctags 等分析工具。
+- `build`: 使用临时容器执行 CMake 构建，默认 `--network none`；只有显式设置 `AUDIT_BUILD_NETWORK_ENABLED=true` 才允许构建容器联网。
+- `verification`: 使用临时容器执行 CLI/harness，固定无网络并限制 CPU、内存和超时。Docker 不可用时返回 `missing_docker`，本地执行结果不能升级为 verified。
+
+`/api/tools` 为每个工具返回 `execution_location`、`container` 和 `network_policy`，backend、Recon、MiningDirector 使用同一份工具可用性结果。
+
 ## 漏洞验证闭环
 
 验证模块采用 `VerificationAgent -> RuntimeManager -> EvidenceCollector -> EvidenceChecker` 的闭环，而不是让 LLM 直接宣布漏洞成立。
 
 - `VerificationAgent`: 理解 finding，分析 source/sink、可达性、触发条件和保护措施。
 - `VerificationPlanner`: 先生成验证计划，明确 runtime_type、entry_point、trigger_type、Oracle 和 max_attempts。
-- `BuildDecisionAgent`: 系统根据语言、构建文件、finding 类型和本机工具自动决定是否构建 C/C++ 项目；前端不再让用户勾选。
+- `BuildManager`: 系统根据语言、构建文件和 finding 类型制定构建计划，但只有任务的 `enable_native_build` 开关开启后才允许执行；沙箱可用性不能绕过该授权。
 - `RuntimeManager`: 对 CLI、Service、Harness 三类运行形态分别执行。C/C++ 优先 CMake + ASAN/UBSAN；无法构建时输出 blocked 和构建/决策证据，不等价于漏洞不存在。
 - `EvidenceCollector`: 保存命令、退出码、stdout、stderr、HTTP 响应、PoC、runbook、构建日志和 verification.json。
 - `EvidenceChecker`: 独立读取真实执行证据，只有命中 Oracle 才输出 `verified` 或 `partially_verified`；否则输出 `not_reproducible`、`blocked`、`false_positive` 或 `uncertain`。

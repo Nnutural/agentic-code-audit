@@ -1,0 +1,46 @@
+{
+  "entry_patterns": [
+    "\\breadMetadata\\b",
+    "\\bread[a-zA-Z]*Header\\b",
+    "\\bparse[a-zA-Z]*\\b",
+    "\\bdecode[a-zA-Z]*\\b",
+    "\\bload[a-zA-Z]*\\b",
+    "\\bopen[a-zA-Z]*\\b",
+    "\\bread[a-zA-Z]*Data\\b",
+    "\\bread[a-zA-Z]*File\\b",
+    "\\breadImage\\b",
+    "\\breadExif\\b",
+    "\\breadJpeg\\b",
+    "\\breadTiff\\b",
+    "\\breadPng\\b",
+    "\\breadRaw\\b",
+    "\\breadHeader\\b",
+    "\\breadDirectory\\b",
+    "\\breadIFD\\b",
+    "\\breadEntry\\b",
+    "\\breadTag\\b",
+    "\\breadValue\\b"
+  ],
+  "parser_structs": [
+    "\\bDataBuf\\b",
+    "\\bBasicIo\\b",
+    "\\bMemIo\\b",
+    "\\bFileIo\\b",
+    "\\bRemoteIo\\b",
+    "\\bIoBase\\b",
+    "\\bSlice\\b",
+    "\\bByteBuffer\\b",
+    "\\bStreamBuffer\\b"
+  ],
+  "length_fields": [
+    "\\bsize_?t?\\b",
+    "\\blen_?\\b",
+    "\\blength_?\\b",
+    "\\bcount_?\\b",
+    "\\bnum_?\\b",
+    "\\boffset_?\\b",
+    "\\bpos_?\\b",
+    "\\bend_?\\b",
+    "\\bstart_?\\b"
+  ]
+}

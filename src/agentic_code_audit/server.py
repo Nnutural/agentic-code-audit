@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
+from .audit_budget import AuditMode
 from .config import Settings
 from .pipeline import AuditPipeline
 from .store import AuditStore
@@ -36,7 +37,7 @@ app.add_middleware(
 
 class TaskCreate(BaseModel):
     target: str
-    mode: str = "full"
+    mode: str = "standard"
     enable_native_build: bool = False
     runtime_url: str = ""
 
@@ -54,7 +55,10 @@ def health() -> dict[str, Any]:
         "llm_provider": settings.llm_provider,
         "deepseek_configured": bool(settings.deepseek_api_key),
         "model": settings.llm_model,
-        "native_build_policy": "auto",
+        "native_build_policy": "task_controlled",
+        "build_network_policy": "bridge" if settings.build_network_enabled else "none",
+        "sandbox_container": settings.sandbox_container,
+        "sandbox_image": settings.sandbox_image,
         "db": str(STORE.db_path),
     }
 
@@ -71,12 +75,16 @@ def create_task(payload: TaskCreate) -> dict[str, Any]:
     settings = Settings.load(APP_ROOT)
     if not settings.llm_api_key:
         raise HTTPException(status_code=400, detail="LLM API key is required.")
+    try:
+        mode = AuditMode.normalize(payload.mode).value
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     task_id = STORE.create_task(
         payload.target,
-        payload.mode,
+        mode,
         settings.llm_model,
         payload.runtime_url,
-        False,
+        payload.enable_native_build,
         llm_provider=settings.llm_provider,
     )
     return {"task_id": task_id, "status": "queued"}
@@ -95,6 +103,7 @@ def start_task(task_id: str, background_tasks: BackgroundTasks) -> dict[str, Any
         "target": task["target"],
         "mode": task["mode"],
         "runtime_url": task.get("runtime_url", ""),
+        "enable_native_build": bool(task.get("enable_native_build", False)),
     }
     background_tasks.add_task(_run_task_threaded, task_id, payload)
     return {"task_id": task_id, "status": "starting"}
@@ -203,6 +212,18 @@ def get_report(task_id: str):
     return PlainTextResponse(path.read_text(encoding="utf-8"))
 
 
+@app.get("/api/tasks/{task_id}/mining-debug.json")
+def get_mining_debug(task_id: str):
+    task = STORE.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    report_dir = task.get("report_dir") or ""
+    debug_path = Path(report_dir) / "mining-debug.json" if report_dir else None
+    if not debug_path or not debug_path.exists():
+        raise HTTPException(status_code=404, detail="mining-debug.json not found")
+    return FileResponse(debug_path, media_type="application/json", filename="mining-debug.json")
+
+
 @app.get("/api/tasks/{task_id}/report.json")
 def get_json_report(task_id: str):
     task = STORE.get_task(task_id)
@@ -256,7 +277,13 @@ def _run_task(task_id: str, payload: dict[str, Any]) -> None:
             STORE.add_event(task_id, agent, event_type, message, metadata)
 
         pipeline = AuditPipeline(settings, event_sink=event_sink)
-        artifacts = pipeline.run(payload["target"], output_dir, runtime_url=payload.get("runtime_url", ""))
+        artifacts = pipeline.run(
+            payload["target"],
+            output_dir,
+            runtime_url=payload.get("runtime_url", ""),
+            mode=payload.get("mode", "standard"),
+            enable_native_build=bool(payload.get("enable_native_build", False)),
+        )
         task = STORE.get_task(task_id)
         if task and task["status"] == "cancelled":
             return
@@ -284,6 +311,14 @@ def _run_task(task_id: str, payload: dict[str, Any]) -> None:
                 {"finding_id": verification.finding_id, "status": verification.status},
                 phase="verification",
             )
+        debug_data = artifacts.report.mining_debug
+        STORE.add_event(
+            task_id, "MiningDebug", "debug_report",
+            f"mining-debug.json: {debug_data.get('candidate_validity_breakdown', {})}",
+            debug_data,
+            phase="debug",
+        )
+
         STORE.save_report(task_id, artifacts.report, artifacts.json_path, artifacts.markdown_path)
         STORE.add_event(
             task_id,
@@ -314,4 +349,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

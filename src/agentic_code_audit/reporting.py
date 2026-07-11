@@ -8,7 +8,7 @@ from .models import AuditReport, Finding, VerificationResult
 
 
 class ReportAgent:
-    """Generate human-readable reports from persisted audit evidence."""
+    """Generate JSON and Markdown reports from persisted audit evidence."""
 
     def write(self, report: AuditReport, output_dir: Path) -> tuple[Path, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -33,9 +33,11 @@ class ReportAgent:
             f"- 本地路径: `{report.target}`",
             f"- Commit: `{report.input_source.commit or 'n/a'}`",
             f"- 生成时间: `{report.created_at}`",
+            f"- 运行模式: `{getattr(report, 'mode', 'standard')}`",
             f"- 模型供应商: `{report.llm_provider}`",
             f"- 模型名称: `{report.llm_model}`",
-            f"- 漏洞数量: `{len(report.findings)}`",
+            f"- 候选漏洞: `{len(report.candidates)}`",
+            f"- 最终 finding: `{len(report.findings)}`",
             f"- 验证尝试: `{len(report.verification_results)}`",
             "",
             "## 项目画像",
@@ -46,11 +48,6 @@ class ReportAgent:
             f"- 包管理/构建文件: `{', '.join(report.profile.package_files) or 'none'}`",
             f"- 攻击面: `{', '.join(report.profile.attack_surfaces) or 'none'}`",
             f"- 推荐工具: `{', '.join(report.profile.recommended_tools) or 'none'}`",
-            f"- 构建入口数: `{len(report.profile.build_entries)}`",
-            f"- 运行入口数: `{len(report.profile.runtime_entries)}`",
-            f"- 测试入口数: `{len(report.profile.test_entries)}`",
-            f"- 验证入口数: `{len(report.profile.verification_entries)}`",
-            f"- 弱化验证策略: `{', '.join(report.profile.weak_verification_strategies) or 'none'}`",
             f"- 攻击优先级: `{', '.join(report.profile.attack_priorities) or 'none'}`",
             f"- 验证提示: `{', '.join(report.profile.verification_hints) or 'none'}`",
             f"- 文件总数: `{report.profile.total_files}`",
@@ -61,46 +58,9 @@ class ReportAgent:
         self._append_profile_entries(lines, "运行入口", report.profile.runtime_entries)
         self._append_profile_entries(lines, "测试入口", report.profile.test_entries)
         self._append_profile_entries(lines, "验证入口", report.profile.verification_entries)
-
-        lines.extend(
-            [
-                "## 工具执行",
-                "",
-            ]
-        )
-        if not report.tool_results:
-            lines.append("- 未执行外部工具。")
-        for result in report.tool_results:
-            command = " ".join(result.command) if result.command else "n/a"
-            artifacts = ", ".join(
-                ref for ref in [result.stdout_artifact_id, result.stderr_artifact_id, result.parsed_artifact_id] if ref
-            )
-            lines.append(
-                f"- `{result.tool}`: **{result.status}**; exit=`{result.exit_code}`; "
-                f"cache_hit=`{result.cache_hit}`; command=`{command}`; artifacts=`{artifacts or 'none'}`; {result.summary}"
-            )
-
-        lines.extend(
-            [
-                "",
-                "## 挖掘流水线",
-                "",
-                f"- 危险函数定位: `{len(report.dangerous_functions)}`",
-                f"- 切片分析: `{len(report.program_slices)}`",
-                f"- 候选漏洞生成: `{len(report.candidates)}`",
-                f"- 最终漏洞判定: `{len(report.findings)}`",
-                "",
-            ]
-        )
-        if report.dangerous_functions:
-            lines.append("### 危险函数样例")
-            for item in report.dangerous_functions[:20]:
-                refs = ", ".join(item.tool_run_refs or item.artifact_refs)
-                lines.append(
-                    f"- `{item.file_path}:{item.line_start}` `{item.function_name or 'unknown'}` "
-                    f"-> `{item.dangerous_api}` ({item.category}); refs=`{refs or 'none'}`"
-                )
-            lines.append("")
+        self._append_mining_strategy(lines, report)
+        self._append_tool_results(lines, report)
+        self._append_mining_summary(lines, report)
 
         lines.extend(["## 漏洞详情", ""])
         if not report.findings:
@@ -129,6 +89,79 @@ class ReportAgent:
             )
         lines.append("")
 
+    def _append_mining_strategy(self, lines: list[str], report: AuditReport) -> None:
+        strategy = report.mining_strategy or {}
+        if not strategy:
+            return
+        tool_names = [
+            f"{item.get('name')}@p{item.get('priority', 1)}"
+            for item in strategy.get("tool_selections", [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        lines.extend(
+            [
+                "## MiningDirector 策略",
+                "",
+                f"- 校验状态: `{strategy.get('validated', False)}`",
+                f"- 工具优先级: `{', '.join(tool_names) or 'none'}`",
+                f"- 关注目录: `{', '.join(strategy.get('focus_directories', [])) or 'none'}`",
+                f"- 优先函数: `{', '.join(strategy.get('priority_functions', [])) or 'none'}`",
+                f"- Parser 入口: `{', '.join(strategy.get('parser_entries', [])) or 'none'}`",
+                f"- 动态验证优先函数: `{', '.join(strategy.get('dynamic_priority_functions', [])) or 'none'}`",
+                f"- 策略说明: {str(strategy.get('rationale', 'n/a'))[:500]}",
+                "",
+            ]
+        )
+        rejected = strategy.get("rejected_strategy_items", [])
+        if rejected:
+            lines.extend(["### 被拒绝的策略项", ""])
+            for item in rejected[:20]:
+                if isinstance(item, dict):
+                    lines.append(f"- `{item.get('kind', 'item')}` `{item.get('value', '')}`: {item.get('reason', '')}")
+            lines.append("")
+        effects = strategy.get("strategy_effects", {})
+        if isinstance(effects, dict) and effects:
+            self._append_json_section(lines, "策略影响", effects)
+
+    def _append_tool_results(self, lines: list[str], report: AuditReport) -> None:
+        lines.extend(["## 工具执行", ""])
+        if not report.tool_results:
+            lines.append("- 未执行外部工具。")
+        for result in report.tool_results:
+            command = " ".join(result.command) if result.command else "n/a"
+            artifacts = ", ".join(
+                ref for ref in [result.stdout_artifact_id, result.stderr_artifact_id, result.parsed_artifact_id] if ref
+            )
+            lines.append(
+                f"- `{result.tool}`: **{result.status}**; exit=`{result.exit_code}`; "
+                f"cache_hit=`{result.cache_hit}`; command=`{command}`; "
+                f"artifacts=`{artifacts or 'none'}`; {result.summary}"
+            )
+        lines.append("")
+
+    def _append_mining_summary(self, lines: list[str], report: AuditReport) -> None:
+        lines.extend(
+            [
+                "## 挖掘流水线",
+                "",
+                f"- 危险函数定位: `{len(report.dangerous_functions)}`",
+                f"- 切片分析: `{len(report.program_slices)}`",
+                f"- 候选漏洞生成: `{len(report.candidates)}`",
+                f"- 聚合候选: `{len(getattr(report, 'aggregated_candidates', []) or [])}`",
+                f"- 最终 finding: `{len(report.findings)}`",
+                "",
+            ]
+        )
+        if report.dangerous_functions:
+            lines.append("### 危险函数样例")
+            for item in report.dangerous_functions[:20]:
+                refs = ", ".join(item.tool_run_refs or item.artifact_refs)
+                lines.append(
+                    f"- `{item.file_path}:{item.line_start}` `{item.function_name or 'unknown'}` "
+                    f"-> `{item.dangerous_api}` ({item.category}); refs=`{refs or 'none'}`"
+                )
+            lines.append("")
+
     def _append_finding(
         self,
         lines: list[str],
@@ -140,6 +173,7 @@ class ReportAgent:
                 f"### {finding.id} - {finding.title}",
                 "",
                 f"- 类型: `{finding.vulnerability_type}`",
+                f"- 风险域: `{finding.risk_domain or 'unknown'}`",
                 f"- 严重性: `{finding.severity}`",
                 f"- 置信度: `{finding.confidence:.2f}`",
                 f"- 证据强度: `{finding.evidence_strength}`",
@@ -147,6 +181,8 @@ class ReportAgent:
                 f"- 可利用性: `{finding.exploitability or 'unknown'}`",
                 f"- 建议验证: `{finding.should_verify}`",
                 f"- 验证状态: `{verification.status if verification else 'not_verified'}`",
+                f"- Director 优先级: `{finding.director_priority}`",
+                f"- Director 理由: `{finding.director_reason or 'none'}`",
                 f"- 位置: `{finding.file_path}:{finding.line_start or ''}`",
                 f"- 函数: `{finding.function_name or 'unknown'}`",
                 f"- Source: `{finding.source or 'unknown'}`",
@@ -168,8 +204,7 @@ class ReportAgent:
             ]
         )
         if finding.exploit_chain:
-            for step in finding.exploit_chain:
-                lines.append(f"- {step}")
+            lines.extend(f"- {step}" for step in finding.exploit_chain)
         else:
             lines.append("- 暂无触发链路描述。")
         if finding.chain_graph.nodes:
@@ -177,6 +212,8 @@ class ReportAgent:
         if finding.trigger_conditions:
             lines.extend(["", "#### 触发条件", ""])
             lines.extend(f"- {condition}" for condition in finding.trigger_conditions)
+        if finding.verification_hint:
+            self._append_json_section(lines, "验证提示", finding.verification_hint)
         if finding.exploit_payloads:
             lines.extend(["", "#### PoC/复现输入", ""])
             lines.extend(f"- `{payload}`" for payload in finding.exploit_payloads)
@@ -200,6 +237,8 @@ class ReportAgent:
                 f"- 方法: `{verification.method}`",
                 f"- 策略: `{verification.strategy or 'n/a'}`",
                 f"- 运行类型: `{verification.runtime_type or 'n/a'}`",
+                f"- 是否执行动态验证: `{verification.dynamic_attempted}`",
+                f"- 阻塞原因: `{verification.blocked_reason or 'none'}`",
                 f"- 本地 fallback: `{verification.local_fallback}`",
                 f"- 验证模式: `{verification.verification_mode or 'n/a'}`",
                 f"- Oracle: {verification.oracle or 'n/a'}",
@@ -213,10 +252,12 @@ class ReportAgent:
             ]
         )
         self._append_list(lines, "环境缺口", verification.environment_gaps)
+        self._append_json_section(lines, "静态验证", verification.static_verification)
+        self._append_json_section(lines, "动态验证计划", verification.dynamic_verification)
         self._append_json_section(lines, "验证计划", verification.verification_plan)
         self._append_json_section(lines, "环境画像", verification.environment)
         self._append_json_section(lines, "执行记录", verification.execution)
-        self._append_json_section(lines, "Checker 判定", verification.checker_details)
+        self._append_json_section(lines, "Checker 判定", verification.checker_verdict or verification.checker_details)
         self._append_list(lines, "证据摘要", verification.evidence)
         if verification.generated_artifacts:
             self._append_list(lines, "生成文件", verification.generated_artifacts)

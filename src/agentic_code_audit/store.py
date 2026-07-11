@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .audit_budget import AuditBudget
 from .models import ArtifactRecord, AuditReport, ProjectProfile, utc_now
 
 
@@ -694,6 +695,11 @@ class AuditStore:
         task["current_phase"] = task.get("current_phase") or ""
         task["progress_done"] = int(task.get("progress_done") or 0)
         task["progress_total"] = int(task.get("progress_total") or 0)
+        task["enable_native_build"] = bool(task.get("enable_native_build", False))
+        try:
+            task["budget"] = AuditBudget.for_mode(task.get("mode") or "standard").to_dict()
+        except ValueError:
+            task["budget"] = AuditBudget.for_mode("standard").to_dict()
         return task
 
     def _file_metadata(self, path: Path) -> tuple[str, int]:

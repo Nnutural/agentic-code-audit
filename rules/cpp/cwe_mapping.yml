@@ -1,0 +1,16 @@
+{
+  "unsafe_c_string_api": "CWE-120",
+  "unsafe_memory_copy": "CWE-787",
+  "integer_overflow": "CWE-190",
+  "out_of_bounds_read": "CWE-125",
+  "out_of_bounds_write": "CWE-787",
+  "use_after_free": "CWE-416",
+  "double_free": "CWE-415",
+  "null_dereference": "CWE-476",
+  "resource_leak": "CWE-404",
+  "command_injection": "CWE-78",
+  "code_execution": "CWE-94",
+  "sql_injection": "CWE-89",
+  "path_traversal": "CWE-22",
+  "deserialization": "CWE-502"
+}
