@@ -25,6 +25,7 @@ from agentic_code_audit.agents.verification import (
     CheckerOutcome,
     CommandInjectionChecker,
     DependencyChecker,
+    DynamicVerificationPlan,
     DynamicPlanner,
     EnvironmentProfile,
     EnvironmentManager,
@@ -1307,6 +1308,39 @@ def test_classifier_adds_non_empty_effect_to_chain_graph():
     assert findings[0].artifact_refs == ["artifact-1"]
 
 
+def test_classifier_queues_source_code_findings_for_static_dynamic_gate():
+    program_slice = ProgramSlice(
+        id="slice-low-score",
+        dangerous_function_id="danger-low-score",
+        file_path="app.py",
+        line_start=7,
+        function_name="read_file",
+        source="source literal",
+        sink="open",
+        context="7: open(path)",
+    )
+    candidate = VulnerabilityCandidate(
+        id="candidate-low-score",
+        slice_id="slice-low-score",
+        title="Path traversal candidate",
+        vulnerability_type="path_traversal",
+        severity="medium",
+        file_path="app.py",
+        line_start=7,
+        description="A file path reaches open().",
+        evidence=["sink=open"],
+        confidence=0.4,
+    )
+
+    findings = VulnerabilityClassifier().classify([candidate], [program_slice], FakeLLM())  # type: ignore[arg-type]
+
+    assert findings
+    assert findings[0].evidence_strength == "weak"
+    assert findings[0].should_verify is True
+    assert findings[0].needs_verification is True
+    assert "Source-code finding is queued for static verification" in findings[0].verification_reason
+
+
 def test_anypoc_cpp_verification_generates_artifacts(tmp_path: Path):
     target = tmp_path / "native"
     target.mkdir()
@@ -1670,6 +1704,40 @@ def test_report_writer_fallback_poc_is_command_template_not_raw_all_a():
     assert "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in poc_section
 
 
+def test_report_writer_filters_manual_validation_payload_from_legacy_findings():
+    finding = Finding(
+        id="finding-manual-placeholder",
+        vulnerability_type="other",
+        severity="medium",
+        title="legacy placeholder",
+        description="legacy placeholder",
+        file_path="app.php",
+        line_start=1,
+        source="request",
+        sink="php.lang.security.exec-use.exec-use",
+        exploit_payloads=["manual-validation-payload"],
+    )
+    report = AuditReport(
+        input_source=InputSource(original="local", kind="local", local_path="local"),
+        target="local",
+        created_at="2026-01-01T00:00:00+00:00",
+        profile=ProjectProfile(root="local", languages={"PHP": 1}),
+        semantic_index=SemanticIndex(),
+        tool_results=[],
+        dangerous_functions=[],
+        program_slices=[],
+        candidates=[],
+        findings=[finding],
+        verification_results=[],
+    )
+
+    markdown = ReportWriter()._to_markdown(report)
+
+    assert "manual-validation-payload" not in markdown
+    assert "[含 PoC]" not in markdown
+    assert "payload=<根据目标协议填写触发字段>" in markdown
+
+
 def test_report_json_endpoint_returns_file_and_404(tmp_path: Path, monkeypatch):
     import agentic_code_audit.server as server_module
 
@@ -1863,6 +1931,37 @@ def test_phase5_static_verifier_uses_trace_and_constrains_llm(tmp_path: Path):
     assert result.dynamic_eligible is True
     assert result.rule_checks["trace_linked"] is True
     assert result.llm_review["status"] == "completed"
+
+
+def test_phase5_static_verifier_reclassifies_source_exec_sink_from_environment(tmp_path: Path):
+    source_dir = tmp_path / "vulnerabilities" / "exec" / "source"
+    source_dir.mkdir(parents=True)
+    php_file = source_dir / "high.php"
+    php_file.write_text(
+        "<?php\n$target = $_REQUEST['ip'];\n$cmd = shell_exec('ping -c 4 ' . $target);\n",
+        encoding="utf-8",
+    )
+    finding = _phase5_finding("other", "vulnerabilities/exec/source/high.php")
+    finding.line_start = 3
+    finding.source = "tool_verified(semgrep)"
+    finding.sink = "php.lang.security.exec-use.exec-use"
+    finding.risk_domain = "environment"
+    finding.should_verify = False
+    finding.needs_verification = False
+    finding.evidence = [
+        "tool_verified(semgrep); sink=php.lang.security.exec-use.exec-use",
+        "$cmd = shell_exec( 'ping  -c 4 ' . $target );",
+    ]
+
+    result = StaticVerifier().verify(tmp_path, finding)
+
+    assert finding.vulnerability_type == "command_injection"
+    assert finding.risk_domain == "source_code"
+    assert finding.should_verify is True
+    assert finding.needs_verification is True
+    assert result.risk_domain == "source_code"
+    assert result.static_status in {"plausible", "weak_static_proof"}
+    assert result.dynamic_eligible is True
 
 
 def test_phase5_non_source_findings_are_static_only_without_poc(tmp_path: Path):
@@ -2501,13 +2600,16 @@ def test_phase8_native_stdin_fallback_avoids_all_a_payload(tmp_path: Path):
     content = poc.poc_path.read_text(encoding="utf-8")
 
     assert poc.poc_path.name == "poc_input.txt"
-    assert "agentic_audit_case=" in content
+    assert "待补充 PoC 输入模板" in content
     assert "sink=strcpy" in content
+    assert "payload=<由 LLM 或人工根据目标协议补充可运行输入>" in content
     assert content.strip("A\n ") != ""
     bug_report = (tmp_path / "out" / "pocs" / finding.id / "bug_report.md").read_text(encoding="utf-8")
-    assert "agentic_audit_case=" in bug_report
+    assert "待补充 PoC 输入模板" in bug_report
     assert "sink=strcpy" in bug_report
     assert ("- `" + ("A" * 128)) not in bug_report
+    assert structured_plan["poc_payload_plan"]["source"] == "template_fallback"
+    assert structured_plan["poc_payload_plan"]["is_template"] is True
 
 
 def test_phase8_llm_payload_planner_can_replace_generic_overflow_probe(tmp_path: Path):
@@ -2536,6 +2638,40 @@ def test_phase8_llm_payload_planner_can_replace_generic_overflow_probe(tmp_path:
 
     assert poc.poc_path.name == "poc_input.txt"
     assert "username" in poc.poc_path.read_text(encoding="utf-8")
+    assert structured_plan["poc_payload_plan"]["source"] == "llm_payload_planner"
+
+
+def test_phase8_poc_generation_prefers_llm_over_recipe_payload(tmp_path: Path):
+    class PayloadLLM:
+        enabled = True
+
+        def chat(self, *_args, **_kwargs):
+            content = json.dumps({
+                "format": "stdin_text",
+                "payloads": ["llm-protocol-field=owned"],
+                "stdin_script": "llm-protocol-field=owned\n",
+                "execution_steps": ["pipe LLM-generated input into the harness"],
+                "expected_signal": "checker marker",
+            })
+            return type("Resp", (), {"ok": True, "content": content, "error": ""})()
+
+    finding = _phase5_finding("unsafe_c_string_api", "main.c")
+    finding.source = "stdin"
+    finding.sink = "strcpy"
+    analysis = PocAnalysis("valid", "cpp_cli", "asan_crash", "details")
+    structured_plan = {
+        "verification_recipe": {
+            "payload_format": "stdin_text",
+            "payloads": ["recipe-should-not-win"],
+            "stdin_script": "recipe-should-not-win\n",
+        }
+    }
+
+    poc = PocGenerator(PayloadLLM()).generate(tmp_path, finding, analysis, tmp_path / "out", structured_plan=structured_plan)
+
+    content = poc.poc_path.read_text(encoding="utf-8")
+    assert "llm-protocol-field=owned" in content
+    assert "recipe-should-not-win" not in content
     assert structured_plan["poc_payload_plan"]["source"] == "llm_payload_planner"
 
 
@@ -2606,11 +2742,11 @@ def test_phase8_llm_all_a_payload_plan_is_rejected(tmp_path: Path):
     content = poc.poc_path.read_text(encoding="utf-8")
 
     assert poc.poc_path.name == "poc_input.txt"
-    assert structured_plan["poc_payload_plan"]["source"] == "deterministic"
-    assert "agentic_audit_case=" in content
+    assert structured_plan["poc_payload_plan"]["source"] == "template_fallback"
+    assert "待补充 PoC 输入模板" in content
     assert "echo 'AAAAAAAA...'" not in content
     bug_report = (tmp_path / "out" / "pocs" / finding.id / "bug_report.md").read_text(encoding="utf-8")
-    assert "agentic_audit_case=" in bug_report
+    assert "待补充 PoC 输入模板" in bug_report
     assert "echo 'AAAAAAAA...'" not in bug_report
 
 
@@ -2642,10 +2778,53 @@ def test_phase8_llm_all_a_payload_with_harness_keeps_code_and_repairs_input(tmp_
     poc_dir = tmp_path / "out" / "pocs" / finding.id
     content = poc.poc_path.read_text(encoding="utf-8")
 
-    assert structured_plan["poc_payload_plan"]["source"].endswith("+structured_input")
-    assert "agentic_audit_case=" in content
+    assert structured_plan["poc_payload_plan"]["source"].endswith("+template")
+    assert structured_plan["poc_payload_plan"]["is_template"] is True
+    assert "待补充 PoC 输入模板" in content
     assert "echo 'AAAAAAAA...'" not in content
     assert "kept harness" in (poc_dir / "poc_harness.c").read_text(encoding="utf-8")
+
+
+def test_phase8_verification_planner_uses_llm_recipe_harness(tmp_path: Path):
+    finding = _phase5_finding("command_injection", "app.py")
+    dynamic_plan = DynamicVerificationPlan(
+        finding_id=finding.id,
+        status="planned",
+        runtime_type="python_test",
+        build_strategy="no_build_required",
+        poc_strategy="harness",
+        oracle="stderr_marker",
+        rationale="LLM should choose focused harness.",
+        verification_recipe={
+            "source_kind": "llm_review",
+            "harness_language": "python",
+            "harness_filename": "cmd_harness.py",
+            "harness_code": "print('[DETECTED] command injection sentinel')\n",
+            "stdin_script": "cmd=;id\n",
+            "expected_signal": "[DETECTED]",
+        },
+    )
+
+    harness = VerificationPlanner().plan(finding, tmp_path, dynamic_plan)
+
+    assert harness.strategy == "llm_generated_harness"
+    assert "cmd_harness.py" in harness.script
+    assert "[DETECTED] command injection sentinel" in harness.script
+    assert harness.command == ["sh", "/workspace/harness.sh"]
+
+
+def test_phase8_environment_enables_php_java_go_harness_runtime(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(EnvironmentManager, "_sandbox_reachable", staticmethod(lambda _container="agentic-code-audit-sandbox": False))
+    monkeypatch.setattr("agentic_code_audit.agents.verification.shutil.which", lambda tool: f"/usr/bin/{tool}")
+    manager = EnvironmentManager()
+
+    php_profile = ProjectProfile(root=str(tmp_path), languages={"PHP": 10}, project_type="library")
+    java_profile = ProjectProfile(root=str(tmp_path), languages={"Java": 10}, project_type="library")
+    go_profile = ProjectProfile(root=str(tmp_path), languages={"Go": 10}, project_type="library")
+
+    assert manager.inspect(tmp_path, php_profile, _phase5_finding("command_injection", "index.php")).runtime_type == "php_test"
+    assert manager.inspect(tmp_path, java_profile, _phase5_finding("deserialization", "Main.java")).runtime_type == "java_test"
+    assert manager.inspect(tmp_path, go_profile, _phase5_finding("path_traversal", "main.go")).runtime_type == "go_test"
 
 
 def test_phase7_cmake_build_uses_ephemeral_offline_container(tmp_path: Path, monkeypatch):

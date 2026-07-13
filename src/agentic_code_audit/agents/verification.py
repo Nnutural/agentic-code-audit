@@ -264,6 +264,7 @@ class StaticVerifier:
         dangerous_function: DangerousFunction | None = None,
         tool_results: list[ToolResult] | None = None,
     ) -> StaticVerificationResult:
+        self._coerce_source_finding(finding, program_slice)
         risk_domain = self._risk_domain(finding)
         source_path = (target / finding.file_path).resolve() if finding.file_path else None
         target_root = target.resolve()
@@ -515,9 +516,96 @@ class StaticVerifier:
 
     def _risk_domain(self, finding: Finding) -> str:
         explicit = str(getattr(finding, "risk_domain", "") or "").strip()
-        if explicit:
+        if explicit and explicit not in {"environment", "other"}:
             return explicit
+        if explicit in {"environment", "other"} and self._source_code_type_hint(finding):
+            return "source_code"
         return risk_domain_for(VulnType.from_string(finding.vulnerability_type)).value
+
+    def _coerce_source_finding(self, finding: Finding, program_slice: ProgramSlice | None = None) -> None:
+        if finding.vulnerability_type not in {"", "other", "weak_static_proof"}:
+            return
+        hint = self._source_code_type_hint(finding, program_slice)
+        if not hint:
+            return
+        finding.vulnerability_type = hint
+        if getattr(finding, "risk_domain", "") in {"", "environment", "other"}:
+            finding.risk_domain = "source_code"
+        finding.should_verify = True
+        finding.needs_verification = True
+        finding.verification_reason = (
+            "Source-code finding was reclassified during static verification; "
+            "dynamic execution depends on the static verdict."
+        )
+
+    @staticmethod
+    def _source_code_type_hint(finding: Finding, program_slice: ProgramSlice | None = None) -> str:
+        if finding.vulnerability_type in {"dependency_vulnerability", "secret_leak", "hardcoded_secret", "supply_chain_config"}:
+            return ""
+        parts = [
+            finding.vulnerability_type,
+            finding.file_path,
+            finding.source,
+            finding.sink,
+            finding.title,
+            finding.description,
+            finding.code_snippet,
+            *(finding.evidence or [])[:8],
+        ]
+        if program_slice:
+            parts.extend([
+                program_slice.rule_vuln_type,
+                program_slice.anchor_category,
+                program_slice.source,
+                program_slice.sink,
+                program_slice.context,
+                program_slice.code_excerpt,
+            ])
+        text = "\n".join(str(item or "") for item in parts).lower()
+        command_markers = (
+            "command_injection",
+            "exec-use",
+            "shell_exec",
+            "passthru",
+            "proc_open",
+            "popen",
+            "system(",
+            "os.system",
+            "subprocess",
+            "child_process",
+            "runtime.exec",
+        )
+        if any(marker in text for marker in command_markers):
+            return "command_injection"
+        sql_markers = (
+            "sql_injection",
+            "sqli",
+            "sql-injection",
+            "mysqli_query",
+            "mysql_query",
+            "pdo::query",
+            "db.query",
+            "executequery",
+        )
+        if any(marker in text for marker in sql_markers):
+            return "sql_injection"
+        path_markers = (
+            "path_traversal",
+            "path-traversal",
+            "file_get_contents",
+            "readfile",
+            "fopen",
+            "include(",
+            "require(",
+            "../",
+            "..\\",
+        )
+        if any(marker in text for marker in path_markers):
+            return "path_traversal"
+        code_markers = ("eval(", "assert(", "create_function", "deserialize", "unserialize")
+        if any(marker in text for marker in code_markers):
+            return "code_execution"
+        return ""
 
     @staticmethod
     def _line_exists(path: Path | None, line_start: int | None) -> bool:
@@ -567,8 +655,16 @@ class EnvironmentManager:
         "clang": "Install LLVM or use the sandbox image.",
         "clang++": "Install LLVM or use the sandbox image.",
         "pytest": "Install pytest in the project environment.",
+        "python": "Install Python or use the sandbox image.",
         "node": "Install Node.js LTS.",
         "npm": "Install Node.js LTS.",
+        "php": "Install PHP CLI or use the sandbox image.",
+        "composer": "Install Composer or use the sandbox image.",
+        "java": "Install a JDK or use the sandbox image.",
+        "javac": "Install a JDK or use the sandbox image.",
+        "mvn": "Install Maven or use the sandbox image.",
+        "gradle": "Install Gradle or use the sandbox image.",
+        "go": "Install Go or use the sandbox image.",
         "curl": "Install curl or use PowerShell Invoke-WebRequest manually.",
         "sqlite3": "Install sqlite3 CLI or use Python sqlite3 for harnesses.",
     }
@@ -582,8 +678,11 @@ class EnvironmentManager:
         available: dict[str, str] = {}
         missing: list[str] = []
         # Tools that must be checked in the sandbox container, not the backend
-        SANDBOX_CHECK_TOOLS = {"cmake", "make", "ninja", "gcc", "g++", "clang", "clang++",
-                               "valgrind", "gdb", "lldb", "ctags"}
+        SANDBOX_CHECK_TOOLS = {
+            "cmake", "make", "ninja", "gcc", "g++", "clang", "clang++",
+            "valgrind", "gdb", "lldb", "ctags", "python", "pytest", "node", "npm",
+            "php", "composer", "java", "javac", "mvn", "gradle", "go",
+        }
         sandbox_available = self._sandbox_reachable(self.sandbox_container)
         for tool in tools:
             if tool in SANDBOX_CHECK_TOOLS and sandbox_available:
@@ -601,8 +700,8 @@ class EnvironmentManager:
         gaps = [f"missing tool: {tool}" for tool in missing]
         if runtime_type in {"static_blocked", "weak_static_proof"}:
             gaps.append("no executable entry point was identified")
-        if runtime_type in {"go_blocked", "rust_blocked", "java_blocked", "php_blocked", "ruby_blocked"}:
-            gaps.append(f"{runtime_type.removesuffix('_blocked')} dynamic verification is not enabled in phase 5")
+        if runtime_type in {"rust_blocked", "ruby_blocked"}:
+            gaps.append(f"{runtime_type.removesuffix('_blocked')} dynamic verification is not enabled in this phase")
         hints = [self.TOOL_HINTS.get(tool, f"Install {tool} or use the Docker sandbox.") for tool in missing]
         can_execute = runtime_type not in {"static_blocked"} and not runtime_type.endswith("_blocked")
         return EnvironmentProfile(
@@ -640,13 +739,13 @@ class EnvironmentManager:
         if suffix in {".js", ".jsx", ".ts", ".tsx"} or {"JavaScript", "TypeScript"} & languages:
             return "node_test"
         if "Go" in languages:
-            return "go_blocked"
+            return "go_test"
         if "Rust" in languages:
             return "rust_blocked"
         if "Java" in languages:
-            return "java_blocked"
+            return "java_test"
         if "PHP" in languages:
-            return "php_blocked"
+            return "php_test"
         if "Ruby" in languages:
             return "ruby_blocked"
         if profile.library_entries or profile.project_type == "library":
@@ -661,6 +760,16 @@ class EnvironmentManager:
             tools.extend(["python", "pytest"])
         if runtime_type == "node_test":
             tools.extend(["node", "npm"])
+        if runtime_type == "php_test":
+            tools.extend(["php", "composer"])
+        if runtime_type == "java_test":
+            tools.extend(["java", "javac"])
+            if (target / "pom.xml").exists():
+                tools.append("mvn")
+            if (target / "build.gradle").exists() or (target / "build.gradle.kts").exists():
+                tools.append("gradle")
+        if runtime_type == "go_test":
+            tools.extend(["go"])
         if runtime_type == "http_service":
             tools.append("curl")
         if target.exists() and any(name.endswith(".db") or name.endswith(".sqlite") for name in os.listdir(target)):
@@ -1582,8 +1691,20 @@ with urlopen(url, timeout=10) as response:
         structured_plan: dict[str, Any],
     ) -> dict[str, Any]:
         recipe = structured_plan.get("verification_recipe") if isinstance(structured_plan.get("verification_recipe"), dict) else {}
+        llm_plan = self._llm_payload_plan(target, finding, analysis, structured_plan)
+        if llm_plan and self._payload_is_specific(llm_plan):
+            return llm_plan
+        if llm_plan and self._plan_has_harness(llm_plan):
+            templated = self._template_payload_plan(finding, source=f"{llm_plan.get('source') or 'llm_payload_planner'}+template")
+            for key in ("harness_code", "harness_language", "harness_filename", "run_commands", "poc_explanation", "execution_steps", "oracle", "expected_signal", "limitations"):
+                if llm_plan.get(key):
+                    templated[key] = llm_plan[key]
+            templated["limitations"] = self._coerce_text_list(templated.get("limitations")) + [
+                "LLM supplied runnable harness material, but the payload was low-information; input remains a fill-in template."
+            ]
+            return templated
         plan = {
-            "source": "deterministic",
+            "source": "recipe",
             "format": str(recipe.get("payload_format") or ""),
             "payloads": self._coerce_text_list(recipe.get("payloads") or finding.exploit_payloads[:5]),
             "stdin_script": str(recipe.get("stdin_script") or ""),
@@ -1595,13 +1716,6 @@ with urlopen(url, timeout=10) as response:
         }
         if self._payload_is_specific(plan):
             return plan
-        llm_plan = self._llm_payload_plan(target, finding, analysis, structured_plan)
-        if llm_plan and self._payload_is_specific(llm_plan):
-            return llm_plan
-        if llm_plan and self._plan_has_harness(llm_plan):
-            repaired = self._replace_low_information_payload(llm_plan, finding)
-            if self._payload_is_specific(repaired):
-                return repaired
         return self._fallback_payload_plan(finding)
 
     def _llm_payload_plan(
@@ -1660,53 +1774,44 @@ with urlopen(url, timeout=10) as response:
         return self._sanitize_payload_plan(parsed, source="llm_payload_planner")
 
     def _fallback_payload_plan(self, finding: Finding) -> dict[str, Any]:
-        if finding.source == "stdin" or "stdin" in finding.trigger_conditions:
-            seed = finding.exploit_payloads[0] if finding.exploit_payloads else ""
-            if self._is_low_information_payload(seed):
-                long_field = "A" * 512
-                seed = "\n".join(
-                    [
-                        f"agentic_audit_case={finding.id}",
-                        f"target_function={finding.function_name or 'unknown'}",
-                        f"source={finding.source or 'stdin'}",
-                        f"sink={finding.sink or 'unknown'}",
-                        f"payload={long_field}",
-                    ]
-                )
-            return {
-                "source": "deterministic",
-                "format": "stdin_text",
-                "payloads": [seed],
-                "stdin_script": seed,
-                "cli_args": [],
-                "config_files": [],
-                "execution_steps": ["Feed poc_input.txt to the target stdin or to a focused harness."],
-                "harness_code": "",
-                "limitations": ["Generic stdin payload; target-specific protocol was not available."],
-            }
+        return self._template_payload_plan(finding, source="template_fallback")
+
+    def _template_payload_plan(self, finding: Finding, source: str = "template_fallback") -> dict[str, Any]:
+        template = "\n".join(
+            [
+                "# 待补充 PoC 输入模板",
+                f"finding_id={finding.id}",
+                f"target_function={finding.function_name or '<待补充目标函数>'}",
+                f"source={finding.source or '<待补充 source>'}",
+                f"sink={finding.sink or '<待补充 sink>'}",
+                "payload=<由 LLM 或人工根据目标协议补充可运行输入>",
+            ]
+        )
         return {
-            "source": "deterministic",
-            "format": "generic_overflow_probe",
-            "payloads": list(finding.exploit_payloads[:3]),
-            "stdin_script": "",
+            "source": source,
+            "format": "poc_template",
+            "payloads": [template],
+            "stdin_script": template,
             "cli_args": [],
             "config_files": [],
-            "execution_steps": ["Replay poc_input.bin through the parser/CLI or focused harness."],
+            "execution_steps": [
+                "当前没有可采纳的 LLM PoC；先根据 source/sink 和目标协议补充 payload。",
+                "补充后在无网络 sandbox 中执行对应 CLI、Runtime 或 harness。",
+            ],
             "harness_code": "",
-            "limitations": ["Generic overflow probe; not protocol-specific."],
+            "limitations": ["这是待补充模板，不是已生成或已验证的 PoC。"],
+            "is_template": True,
         }
 
     def _native_payload(self, finding: Finding, payload_plan: dict[str, Any] | None = None) -> bytes:
         payload_plan = payload_plan or {}
         payloads = [str(item) for item in payload_plan.get("payloads", []) if str(item)]
-        if payloads and payload_plan.get("format") not in {"generic_overflow_probe", "binary"}:
+        if payloads:
             return ("\n".join(payloads) + "\n").encode("utf-8", errors="replace")
+        if payload_plan.get("is_template"):
+            return self._native_text_payload(finding, payload_plan).encode("utf-8", errors="replace")
         marker = f"AGENTIC_CODE_AUDIT_{finding.id}".encode("ascii", errors="ignore")
-        if finding.vulnerability_type in {"unsafe_memory_copy", "unsafe_c_string_api", "memory_corruption"}:
-            return marker + b"\x00" + (b"A" * 8192) + b"\xff\xd8\xff\xe0" + b"B" * 2048
-        if finding.vulnerability_type == "path_traversal":
-            return b"../../../../etc/passwd\x00" + marker
-        return marker + b"\n" + (b"A" * 4096)
+        return marker + b"\npayload=<LLM-generated binary payload required>\n"
 
     def _native_text_payload(self, finding: Finding, payload_plan: dict[str, Any]) -> str:
         lines = [
@@ -1723,7 +1828,7 @@ with urlopen(url, timeout=10) as response:
             lines.extend([stdin_script, ""])
         else:
             payloads = [str(item) for item in payload_plan.get("payloads", []) if str(item)]
-            lines.extend(payloads or finding.exploit_payloads or ["A" * 512])
+            lines.extend(payloads or ["payload=<由 LLM 或人工根据目标协议补充可运行输入>"])
         return "\n".join(lines)
 
     def _write_verification_poc_artifacts(
@@ -1745,10 +1850,6 @@ with urlopen(url, timeout=10) as response:
         artifacts.append(explanation_path)
 
         harness_code, harness_name, harness_language = self._extract_harness_code(payload_plan)
-        if not harness_code and finding.vulnerability_type in {"unsafe_memory_copy", "unsafe_c_string_api", "memory_corruption"}:
-            harness_code = self._deterministic_c_poc_harness(finding)
-            harness_name = "poc_harness.c"
-            harness_language = "c"
         harness_path: Path | None = None
         if harness_code and self._harness_code_is_safe(harness_code):
             harness_path = poc_dir / self._safe_harness_filename(harness_name, harness_language)
@@ -1850,17 +1951,38 @@ with urlopen(url, timeout=10) as response:
             return "cpp"
         if suffix == ".py":
             return "python"
+        if suffix == ".php":
+            return "php"
+        if suffix in {".js", ".mjs", ".cjs"}:
+            return "javascript"
+        if suffix == ".java":
+            return "java"
+        if suffix == ".go":
+            return "go"
         if suffix in {".sh", ".bash"}:
             return "shell"
         return ""
 
     def _safe_harness_filename(self, harness_name: str, harness_language: str) -> str:
         name = Path(harness_name or "").name
+        extensions = {
+            "cpp": ".cpp",
+            "c++": ".cpp",
+            "python": ".py",
+            "php": ".php",
+            "javascript": ".js",
+            "js": ".js",
+            "node": ".js",
+            "java": ".java",
+            "go": ".go",
+            "shell": ".sh",
+            "sh": ".sh",
+        }
         if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-            ext = { "cpp": ".cpp", "c++": ".cpp", "python": ".py", "shell": ".sh", "sh": ".sh" }.get(harness_language, ".c")
+            ext = extensions.get(harness_language, ".c")
             name = f"poc_harness{ext}"
         if not name.startswith("poc_harness"):
-            suffix = Path(name).suffix or { "cpp": ".cpp", "c++": ".cpp", "python": ".py", "shell": ".sh", "sh": ".sh" }.get(harness_language, ".c")
+            suffix = Path(name).suffix or extensions.get(harness_language, ".c")
             name = f"poc_harness{suffix}"
         return name
 
@@ -1883,27 +2005,6 @@ with urlopen(url, timeout=10) as response:
         ]
         return not any(token in lowered for token in blocked)
 
-    def _deterministic_c_poc_harness(self, finding: Finding) -> str:
-        source = (finding.source or "stdin").replace('"', '\\"')[:120]
-        sink = (finding.sink or "strcpy").replace('"', '\\"')[:120]
-        return f'''#include <stdio.h>
-#include <string.h>
-
-int main(void) {{
-    char dst[32];
-    char input[512];
-    if (!fgets(input, sizeof(input), stdin)) {{
-        return 2;
-    }}
-    input[strcspn(input, "\\n")] = '\\0';
-    printf("[HARNESS] source: {source}\\n");
-    printf("[HARNESS] sink: {sink}\\n");
-    strcpy(dst, input);
-    printf("[HARNESS] copied input into fixed buffer\\n");
-    return 0;
-}}
-'''
-
     def _run_poc_script(self, payload_plan: dict[str, Any], poc_path: Path, harness_path: Path | None) -> str:
         commands = self._safe_run_commands(payload_plan)
         if commands:
@@ -1922,6 +2023,14 @@ int main(void) {{
                 )
             elif suffix == ".py":
                 body = f"python {name} < {input_name}"
+            elif suffix == ".php":
+                body = f"php {name} < {input_name}"
+            elif suffix in {".js", ".mjs", ".cjs"}:
+                body = f"node {name} < {input_name}"
+            elif suffix == ".go":
+                body = f"go run {name} < {input_name}"
+            elif suffix == ".java":
+                body = "\n".join([f"javac {name}", f"java {shlex.quote(harness_path.stem)} < {input_name}"])
             else:
                 body = f"sh {name}"
         else:
@@ -1952,13 +2061,15 @@ int main(void) {{
     @staticmethod
     def _payload_is_text(payload_plan: dict[str, Any]) -> bool:
         fmt = str(payload_plan.get("format", "")).lower()
-        return fmt in {"stdin_text", "stdin_input", "text", "cli_session", "config", "http_request"} or bool(payload_plan.get("stdin_script"))
+        return fmt in {"stdin_text", "stdin_input", "text", "cli_session", "config", "http_request", "poc_template"} or bool(payload_plan.get("stdin_script"))
 
     def _payload_is_specific(self, payload_plan: dict[str, Any]) -> bool:
         fmt = str(payload_plan.get("format", "")).lower()
         if self._payload_plan_is_low_information(payload_plan):
             return False
-        if fmt and fmt != "generic_overflow_probe":
+        if payload_plan.get("is_template"):
+            return False
+        if fmt and fmt not in {"generic_overflow_probe", "poc_template"}:
             return True
         return bool(payload_plan.get("stdin_script") or payload_plan.get("config_files") or payload_plan.get("harness_code"))
 
@@ -2020,27 +2131,6 @@ int main(void) {{
 
     def _plan_has_harness(self, payload_plan: dict[str, Any]) -> bool:
         return bool(self._extract_harness_code(payload_plan)[0])
-
-    def _replace_low_information_payload(self, payload_plan: dict[str, Any], finding: Finding) -> dict[str, Any]:
-        repaired = dict(payload_plan)
-        repaired["source"] = f"{payload_plan.get('source') or 'llm_payload_planner'}+structured_input"
-        repaired["format"] = "stdin_text"
-        seed = "\n".join(
-            [
-                f"agentic_audit_case={finding.id}",
-                f"target_function={finding.function_name or 'unknown'}",
-                f"source={finding.source or 'stdin'}",
-                f"sink={finding.sink or 'unknown'}",
-                "payload=target_specific_boundary_input",
-            ]
-        )
-        repaired["payloads"] = [seed]
-        repaired["stdin_script"] = seed
-        repaired.setdefault("limitations", [])
-        repaired["limitations"] = self._coerce_text_list(repaired.get("limitations")) + [
-            "LLM payload was low-information and was replaced with structured stdin content."
-        ]
-        return repaired
 
     @staticmethod
     def _parse_json_object(content: str) -> dict[str, Any]:
@@ -2487,7 +2577,15 @@ class VerificationPlanner:
     def __init__(self, llm_client: DeepSeekClient | None = None) -> None:
         self.llm_client = llm_client
 
-    def plan(self, finding: Finding, target: Path) -> HarnessPlan:
+    def plan(
+        self,
+        finding: Finding,
+        target: Path,
+        dynamic_plan: DynamicVerificationPlan | None = None,
+    ) -> HarnessPlan:
+        recipe_plan = self._recipe_harness_plan(finding, dynamic_plan)
+        if recipe_plan:
+            return recipe_plan
         return self._fallback_plan(finding, target)
 
     def partial_proof_plan(
@@ -2496,6 +2594,9 @@ class VerificationPlanner:
         target: Path,
         dynamic_plan: DynamicVerificationPlan,
     ) -> HarnessPlan:
+        recipe_plan = self._recipe_harness_plan(finding, dynamic_plan, partial=True)
+        if recipe_plan:
+            return recipe_plan
         suffix = Path(finding.file_path).suffix.lower()
         if suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"} or dynamic_plan.runtime_type in {"cpp_cli", "cpp_harness"}:
             return self._c_micro_proof_plan(finding, dynamic_plan)
@@ -2569,6 +2670,208 @@ else:
             weak_verification_strategy="Preserve static anchors and blocked reason.",
             safety_notes=["No external network access.", "Short-lived local harness only when Docker is unavailable."],
         )
+
+    def _recipe_harness_plan(
+        self,
+        finding: Finding,
+        dynamic_plan: DynamicVerificationPlan | None,
+        partial: bool = False,
+    ) -> HarnessPlan | None:
+        if not dynamic_plan or not isinstance(dynamic_plan.verification_recipe, dict):
+            return None
+        recipe = dynamic_plan.verification_recipe
+        harness_code = str(recipe.get("harness_code") or "").strip()
+        if not harness_code or not self._harness_code_is_safe(harness_code):
+            return None
+        language = self._normalize_language(str(recipe.get("harness_language") or self._language_from_finding(finding)))
+        filename = self._safe_harness_filename(str(recipe.get("harness_filename") or ""), language)
+        script = self._script_for_recipe_harness(recipe, harness_code, filename, language)
+        if not script:
+            return None
+        marker = str(recipe.get("expected_signal") or recipe.get("oracle") or dynamic_plan.oracle or "[DETECTED]")[:300]
+        if "[DETECTED]" not in marker and marker.lower() in {"asan_crash", "ubsan", "nonzero_exit", "stderr_marker", "output_diff"}:
+            marker = "[DETECTED]"
+        return HarnessPlan(
+            method="LLM generated verification harness" if not partial else "LLM generated partial verification harness",
+            language="shell",
+            script=script,
+            command=["sh", "/workspace/harness.sh"],
+            oracle=f"{marker} in stdout/stderr or checker-specific signal",
+            explanation="LLM recipe supplied the concrete local harness; system executes it in a no-network sandbox and validates evidence.",
+            strategy="llm_generated_harness" if not partial else "llm_partial_harness",
+            runtime_type=dynamic_plan.runtime_type,
+            rationale=dynamic_plan.rationale,
+            commands=[["sh", "/workspace/harness.sh"]],
+            expected_signal=marker,
+            fallbacks=["weak_static_proof"],
+            environment_requirements=self._requirements_for_language(language),
+            mock_strategy=str(recipe.get("fallback_harness") or "LLM-designed focused harness with mocked dependencies."),
+            weak_verification_strategy="Record harness evidence only; do not upgrade partial evidence to full verified.",
+            safety_notes=["No network.", "No destructive commands.", "LLM tactics cannot override proof labels or sandbox policy."],
+        )
+
+    def _script_for_recipe_harness(
+        self,
+        recipe: dict[str, Any],
+        harness_code: str,
+        filename: str,
+        language: str,
+    ) -> str:
+        stdin_text = self._recipe_stdin(recipe)
+        setup = [
+            "set -eu",
+            "cat > poc_input.txt <<'EOF_INPUT'",
+            stdin_text,
+            "EOF_INPUT",
+            f"cat > {shlex.quote(filename)} <<'EOF_HARNESS'",
+            harness_code,
+            "EOF_HARNESS",
+        ]
+        commands = self._safe_run_commands(recipe)
+        if not commands:
+            commands = self._default_run_commands(filename, language)
+        if not commands:
+            return ""
+        return "\n".join([*setup, *commands, ""])
+
+    @staticmethod
+    def _recipe_stdin(recipe: dict[str, Any]) -> str:
+        stdin_script = str(recipe.get("stdin_script") or "").strip()
+        if stdin_script:
+            return stdin_script
+        payloads = recipe.get("payloads")
+        if isinstance(payloads, list) and payloads:
+            return "\n".join(str(item) for item in payloads)
+        if payloads:
+            return str(payloads)
+        return "payload=<fill target-specific input before manual replay>"
+
+    @staticmethod
+    def _safe_run_commands(recipe: dict[str, Any]) -> list[str]:
+        raw = recipe.get("run_commands") or recipe.get("commands") or []
+        if not isinstance(raw, list):
+            raw = [raw]
+        safe: list[str] = []
+        blocked = ["curl ", "wget ", " nc ", " ncat ", "://", "sudo ", "rm -", "mkfs", "dd ", "chmod 777"]
+        for item in raw:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(token in lowered for token in blocked):
+                continue
+            safe.append(text[:2000])
+        return safe[:6]
+
+    @staticmethod
+    def _default_run_commands(filename: str, language: str) -> list[str]:
+        quoted = shlex.quote(filename)
+        if language == "python":
+            return [f"python {quoted} < poc_input.txt"]
+        if language in {"javascript", "node"}:
+            return [f"node {quoted} < poc_input.txt"]
+        if language == "php":
+            return [f"php {quoted} < poc_input.txt"]
+        if language in {"shell", "bash", "sh"}:
+            return [f"sh {quoted} < poc_input.txt"]
+        if language == "go":
+            return [f"go run {quoted} < poc_input.txt"]
+        if language == "java":
+            class_name = Path(filename).stem
+            return [f"javac {quoted}", f"java {shlex.quote(class_name)} < poc_input.txt"]
+        if language in {"c", "cpp", "c++"}:
+            compiler = "${CXX:-c++}" if language in {"cpp", "c++"} else "${CC:-cc}"
+            return [
+                f"{compiler} -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer {quoted} -o poc_harness",
+                "ASAN_OPTIONS=detect_stack_use_after_return=1 ./poc_harness < poc_input.txt",
+            ]
+        return []
+
+    @staticmethod
+    def _normalize_language(language: str) -> str:
+        normalized = language.strip().lower()
+        aliases = {
+            "py": "python",
+            "js": "javascript",
+            "nodejs": "javascript",
+            "node": "javascript",
+            "c++": "cpp",
+            "cc": "cpp",
+            "cxx": "cpp",
+            "golang": "go",
+            "bash": "shell",
+            "sh": "shell",
+        }
+        return aliases.get(normalized, normalized or "python")
+
+    @staticmethod
+    def _language_from_finding(finding: Finding) -> str:
+        suffix = Path(finding.file_path).suffix.lower()
+        if suffix == ".py":
+            return "python"
+        if suffix in {".js", ".jsx", ".ts", ".tsx"}:
+            return "javascript"
+        if suffix == ".php":
+            return "php"
+        if suffix == ".java":
+            return "java"
+        if suffix == ".go":
+            return "go"
+        if suffix == ".c":
+            return "c"
+        if suffix in {".cc", ".cpp", ".cxx"}:
+            return "cpp"
+        return "python"
+
+    @staticmethod
+    def _safe_harness_filename(name: str, language: str) -> str:
+        candidate = Path(name or "").name
+        if candidate and re.fullmatch(r"[A-Za-z0-9_.-]+", candidate):
+            return candidate
+        suffix = {
+            "python": ".py",
+            "javascript": ".js",
+            "php": ".php",
+            "java": ".java",
+            "go": ".go",
+            "c": ".c",
+            "cpp": ".cpp",
+            "shell": ".sh",
+        }.get(language, ".py")
+        return f"poc_harness{suffix}"
+
+    @staticmethod
+    def _requirements_for_language(language: str) -> list[str]:
+        return {
+            "python": ["python"],
+            "javascript": ["node"],
+            "php": ["php"],
+            "java": ["java", "javac"],
+            "go": ["go"],
+            "c": ["cc", "asan", "ubsan"],
+            "cpp": ["c++", "asan", "ubsan"],
+            "shell": ["sh"],
+        }.get(language, [language])
+
+    @staticmethod
+    def _harness_code_is_safe(harness_code: str) -> bool:
+        lowered = harness_code.lower()
+        blocked = [
+            "socket(",
+            "connect(",
+            "curl ",
+            "wget ",
+            "ncat ",
+            " nc ",
+            "rm -rf",
+            "unlink(",
+            "remove(",
+            "rmdir(",
+            "mkfs",
+            "dd if=",
+            "sudo ",
+        ]
+        return not any(token in lowered for token in blocked)
 
     def _c_micro_proof_plan(self, finding: Finding, dynamic_plan: DynamicVerificationPlan) -> HarnessPlan:
         marker = "[DETECTED] partial dynamic proof"
@@ -2860,7 +3163,7 @@ class DynamicPlanner:
     """Create an executable verification plan after static verification and budget gating."""
 
     ELIGIBLE_STATIC_STATUSES = {"plausible", "weak_static_proof"}
-    RUNTIME_TYPES = {"cpp_cli", "cpp_harness", "python_test", "node_test", "http_service", "library_harness"}
+    RUNTIME_TYPES = {"cpp_cli", "cpp_harness", "python_test", "node_test", "php_test", "java_test", "go_test", "http_service", "library_harness"}
     BUILD_STRATEGIES = {"existing_binary", "cmake_build", "autotools_build", "make_build", "meson_build", "no_build_possible", "no_build_required"}
     POC_STRATEGIES = {"malformed_file", "cli_arg", "unit_test", "harness", "http_request"}
     ORACLES = {"asan_crash", "ubsan", "nonzero_exit", "stderr_marker", "output_diff", "timeout", "http_status_or_body_marker", "nonzero_exit_or_checker_marker"}
@@ -2932,6 +3235,24 @@ class DynamicPlanner:
             strategy = "node_harness_or_npm_test"
             rationale = "Node.js supports npm tests or a constrained generated harness."
             if "node" in environment.missing_tools:
+                status = "blocked"
+                blocked_reason = "missing_tool"
+        elif runtime_type == "php_test":
+            strategy = "php_harness_or_phpunit"
+            rationale = "PHP supports a constrained generated harness or PHPUnit-style local replay."
+            if "php" in environment.missing_tools:
+                status = "blocked"
+                blocked_reason = "missing_tool"
+        elif runtime_type == "java_test":
+            strategy = "java_harness_or_junit"
+            rationale = "Java supports a constrained generated harness compiled with javac or project test tooling."
+            if "java" in environment.missing_tools or "javac" in environment.missing_tools:
+                status = "blocked"
+                blocked_reason = "missing_tool"
+        elif runtime_type == "go_test":
+            strategy = "go_harness_or_go_test"
+            rationale = "Go supports a constrained generated harness or go test style replay."
+            if "go" in environment.missing_tools:
                 status = "blocked"
                 blocked_reason = "missing_tool"
         elif runtime_type == "library_harness":
@@ -3153,6 +3474,9 @@ class DynamicPlanner:
             "cli_args",
             "config_files",
             "harness_code",
+            "harness_language",
+            "harness_filename",
+            "run_commands",
             "execution_steps",
             "oracle",
             "expected_signal",
@@ -3187,6 +3511,9 @@ class DynamicPlanner:
             "cpp_harness": {"malformed_file", "cli_arg", "harness"},
             "python_test": {"unit_test", "harness"},
             "node_test": {"unit_test", "harness"},
+            "php_test": {"unit_test", "harness"},
+            "java_test": {"unit_test", "harness"},
+            "go_test": {"unit_test", "harness"},
             "http_service": {"http_request"},
             "library_harness": {"harness", "unit_test"},
         }
@@ -3273,7 +3600,7 @@ class DynamicPlanner:
             return "http_request"
         if runtime_type in {"cpp_cli", "cpp_harness"}:
             return "malformed_file" if finding.vulnerability_type not in {"command_injection"} else "cli_arg"
-        if runtime_type in {"python_test", "node_test"}:
+        if runtime_type in {"python_test", "node_test", "php_test", "java_test", "go_test"}:
             return "unit_test"
         if runtime_type == "library_harness":
             return "harness"
@@ -3316,8 +3643,8 @@ class DynamicPlanner:
                 "If target-specific harness compilation is not possible, compile/run a minimal no-network proof that "
                 "exercises the same sink pattern and records limitations."
             ),
-            "payloads": list(finding.exploit_payloads[:5]),
-            "payload_format": "generic_overflow_probe",
+            "payloads": [],
+            "payload_format": "poc_template",
             "stdin_script": "",
             "cli_args": [],
             "config_files": [],
@@ -3370,6 +3697,12 @@ class RuntimeManager:
             return RuntimeDecision("python_test", "python_harness_or_pytest", "Python runtime can use pytest/direct harness.", can_execute=True)
         if runtime_type == "node_test":
             return RuntimeDecision("node_test", "node_harness_or_npm_test", "Node runtime can use npm test or a Node harness.", can_execute=True)
+        if runtime_type == "php_test":
+            return RuntimeDecision("php_test", "php_harness_or_phpunit", "PHP runtime can use a constrained generated harness.", can_execute=True)
+        if runtime_type == "java_test":
+            return RuntimeDecision("java_test", "java_harness_or_junit", "Java runtime can use javac/JUnit-style constrained harnesses.", can_execute=True)
+        if runtime_type == "go_test":
+            return RuntimeDecision("go_test", "go_harness_or_go_test", "Go runtime can use go test or a constrained generated harness.", can_execute=True)
         if runtime_type == "library_harness":
             return RuntimeDecision("library_harness", "generated_library_harness", "Library/plugin project needs a mock host/harness.", can_execute=True)
         if runtime_type.endswith("_blocked"):
@@ -3406,7 +3739,7 @@ class RuntimeManager:
         harness.strategy = decision.strategy
         outcome = self.sandbox.execute(harness, plan.poc_dir / "sandbox")
         checked = self.checker.dispatch(plan.finding, outcome)
-        if outcome.status == "verified" and decision.runtime_type in {"cpp_harness", "python_test", "node_test", "library_harness"}:
+        if outcome.status == "verified" and decision.runtime_type in {"cpp_harness", "python_test", "node_test", "php_test", "java_test", "go_test", "library_harness"}:
             checked.status = "harness_reproduced"
             checked.summary = "Generated harness reproduced the configured oracle; this is not full target runtime verification."
             checked.checker_details["proof_level"] = "generated_harness"
@@ -3466,20 +3799,45 @@ class RuntimeManager:
                     "blocked_reason": dynamic_plan.blocked_reason,
                 },
             )
-        return self.execute(
+        return self._execute_with_dynamic_plan(
             target,
             profile,
             poc_plan,
-            dynamic_plan.to_runtime_decision(),
+            dynamic_plan,
             runtime_url,
             planner,
         )
+
+    def _execute_with_dynamic_plan(
+        self,
+        target: Path,
+        profile: ProjectProfile,
+        plan: PocPlan,
+        dynamic_plan: DynamicVerificationPlan,
+        runtime_url: str,
+        planner: VerificationPlanner,
+    ) -> CheckerOutcome:
+        decision = dynamic_plan.to_runtime_decision()
+        if decision.runtime_type in {"dependency_only", "weak_static_proof", "static_blocked"} or decision.runtime_type.endswith("_blocked"):
+            return self.execute(target, profile, plan, decision, runtime_url, planner)
+        if decision.runtime_type == "http_service" or plan.analysis.verification_mode == "cpp_cli":
+            return self.execute(target, profile, plan, decision, runtime_url, planner)
+        harness = planner.plan(plan.finding, target, dynamic_plan)
+        harness.runtime_type = decision.runtime_type
+        harness.strategy = harness.strategy or decision.strategy
+        outcome = self.sandbox.execute(harness, plan.poc_dir / "sandbox")
+        checked = self.checker.dispatch(plan.finding, outcome)
+        if outcome.status == "verified" and decision.runtime_type in {"cpp_harness", "python_test", "node_test", "php_test", "java_test", "go_test", "library_harness"}:
+            checked.status = "harness_reproduced"
+            checked.summary = "Generated harness reproduced the configured oracle; this is not full target runtime verification."
+            checked.checker_details["proof_level"] = "generated_harness"
+        return checked
 
     @staticmethod
     def _can_attempt_partial_proof(dynamic_plan: DynamicVerificationPlan) -> bool:
         if dynamic_plan.blocked_reason in {"build_disabled", "dynamic_budget_exhausted", "risk_domain_static_only"}:
             return False
-        if dynamic_plan.runtime_type in {"cpp_harness", "cpp_cli", "python_test", "node_test", "library_harness"}:
+        if dynamic_plan.runtime_type in {"cpp_harness", "cpp_cli", "python_test", "node_test", "php_test", "java_test", "go_test", "library_harness"}:
             return dynamic_plan.blocked_reason in {
                 "build_failed",
                 "binary_not_found",

@@ -90,8 +90,7 @@ class ReportAgent:
         poc_count = sum(
             1
             for finding in report.findings
-            if finding.exploit_payloads
-            or (verification_by_finding.get(finding.id) and verification_by_finding[finding.id].poc_path)
+            if self._has_reportable_poc(finding, verification_by_finding.get(finding.id))
         )
         lines.extend(
             [
@@ -221,9 +220,28 @@ class ReportAgent:
         if verification and verification.validation_tags:
             labels = [str(item.get("label", "")).strip() for item in verification.validation_tags if isinstance(item, dict)]
             badges.extend(f"[{label}]" for label in labels[:4] if label)
-        if finding.exploit_payloads or (verification and (verification.poc_path or verification.payloads)):
+        if self._has_reportable_poc(finding, verification):
             badges.append("[含 PoC]")
         return " ".join(badges)
+
+    def _has_reportable_poc(self, finding: Finding, verification: VerificationResult | None) -> bool:
+        if self._reportable_payloads(finding, verification):
+            return True
+        if not verification:
+            return False
+        if verification.poc_path and verification.verification_mode not in {"static_only", "static_evidence", "dependency_only"}:
+            return True
+        artifact_names = {
+            "run_poc.sh",
+            "poc_harness.c",
+            "poc_harness.cpp",
+            "poc_harness.py",
+            "poc_harness.php",
+            "poc_harness.js",
+            "poc_harness.java",
+            "poc_harness.go",
+        }
+        return any(Path(str(path)).name in artifact_names for path in verification.generated_artifacts)
 
     def _verification_payloads(self, finding: Finding, verification: VerificationResult | None) -> list[str]:
         payloads: list[str] = []
@@ -245,6 +263,11 @@ class ReportAgent:
     def _is_low_information_payload(self, payload: str) -> bool:
         text = str(payload or "").strip()
         if not text:
+            return True
+        lowered = text.lower()
+        if lowered in {"manual-validation-payload", "manual_validation_payload"}:
+            return True
+        if "manual-validation-payload" in lowered:
             return True
         compact = "".join(ch for ch in text if not ch.isspace())
         if len(compact) >= 32 and len(set(compact)) <= 2:

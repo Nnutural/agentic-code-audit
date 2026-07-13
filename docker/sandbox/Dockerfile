@@ -50,7 +50,14 @@ RUN set -eux; \
       nodejs \
       npm \
       php-cli \
+      php-curl \
+      php-gd \
+      php-intl \
+      php-mbstring \
+      php-mysql \
+      php-sqlite3 \
       php-xml \
+      php-zip \
       pkg-config \
       postgresql-client \
       ripgrep \

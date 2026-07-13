@@ -244,7 +244,7 @@ class AnalysisAgent:
             "path_traversal": ["../../../../etc/passwd", "..\\..\\..\\Windows\\win.ini"],
             "hardcoded_secret": ["rotate-secret", "secret-scan-confirmation"],
         }
-        return payloads.get(finding.vulnerability_type, ["manual-validation-payload"])
+        return payloads.get(finding.vulnerability_type, [])
 
     def _exploit_chain_for(self, finding: Finding) -> list[str]:
         if finding.vulnerability_type == "hardcoded_secret":

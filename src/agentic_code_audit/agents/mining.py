@@ -2101,12 +2101,10 @@ Source: {program_slice.source}
         return "weak"
 
     def _should_verify(self, vuln_type: VulnType, evidence_strength: str, total_score: int) -> bool:
-        # Non-source-code risk domains never enter dynamic verification
-        if not is_dynamic_verification_candidate(vuln_type):
-            return False
-        if evidence_strength == "strong":
-            return True
-        return total_score >= 6
+        # Mining should not discard source-code findings before the static
+        # verifier can classify the trace. Static verification later gates
+        # execution to plausible / weak_static_proof findings.
+        return is_dynamic_verification_candidate(vuln_type)
 
     def _summary(
         self,
@@ -2185,10 +2183,8 @@ Source: {program_slice.source}
         if not is_dynamic_verification_candidate(vuln_type_enum):
             return "Static evidence should be confirmed, but dynamic verification is not prioritized."
         if evidence_strength == "strong":
-            return "Strong source-to-sink evidence justifies verification."
-        if total_score >= 6:
-            return "Rule score crosses the verification threshold."
-        return "Evidence is currently too weak for prioritized verification."
+            return "Source-code finding enters static gate before dynamic verification."
+        return "Source-code finding is queued for static verification; dynamic execution depends on the static verdict."
 
     def _recommendation(self, vuln_type: str) -> str:
         mapping = {
@@ -2229,7 +2225,7 @@ Source: {program_slice.source}
             "resource_leak": [],
             "code_execution": ["__import__('os').system('id')"],
         }
-        return mapping.get(vuln_type, ["manual-validation-payload"])
+        return mapping.get(vuln_type, [])
 
 
 class VulnerabilityMiningAgent:
